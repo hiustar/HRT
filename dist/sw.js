@@ -1,0 +1,131 @@
+/**
+ * Copyright 2018 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// If the loader is already loaded, just stop.
+if (!self.define) {
+  let registry = {};
+
+  // Used for `eval` and `importScripts` where we can't get script URL by other means.
+  // In both cases, it's safe to use a global var because those functions are synchronous.
+  let nextDefineUri;
+
+  const singleRequire = (uri, parentUri) => {
+    uri = new URL(uri + ".js", parentUri).href;
+    return registry[uri] || (
+      
+        new Promise(resolve => {
+          if ("document" in self) {
+            const script = document.createElement("script");
+            script.src = uri;
+            script.onload = resolve;
+            document.head.appendChild(script);
+          } else {
+            nextDefineUri = uri;
+            importScripts(uri);
+            resolve();
+          }
+        })
+      
+      .then(() => {
+        let promise = registry[uri];
+        if (!promise) {
+          throw new Error(`Module ${uri} didn’t register its module`);
+        }
+        return promise;
+      })
+    );
+  };
+
+  self.define = (depsNames, factory) => {
+    const uri = nextDefineUri || ("document" in self ? document.currentScript.src : "") || location.href;
+    if (registry[uri]) {
+      // Module is already loading or loaded.
+      return;
+    }
+    let exports = {};
+    const require = depUri => singleRequire(depUri, uri);
+    const specialDeps = {
+      module: { uri },
+      exports,
+      require
+    };
+    registry[uri] = Promise.all(depsNames.map(
+      depName => specialDeps[depName] || require(depName)
+    )).then(deps => {
+      factory(...deps);
+      return exports;
+    });
+  };
+}
+define(['./workbox-35c88359'], (function (workbox) { 'use strict';
+
+  self.skipWaiting();
+  workbox.clientsClaim();
+
+  /**
+   * The precacheAndRoute() method efficiently caches and responds to
+   * requests for URLs in the manifest.
+   * See https://goo.gl/S9QRab
+   */
+  workbox.precacheAndRoute([{
+    "url": "registerSW.js",
+    "revision": "1872c500de691dce40960bb85481de07"
+  }, {
+    "url": "index.html",
+    "revision": "376d3e5f99bd04146f847c4bd8c4fb61"
+  }, {
+    "url": "assets/purify.es-B9ZVCkUG.js",
+    "revision": null
+  }, {
+    "url": "assets/index.es-BPu-Pqr0.js",
+    "revision": null
+  }, {
+    "url": "assets/index-qCxvOS-x.js",
+    "revision": null
+  }, {
+    "url": "assets/index-BrQNKb_H.css",
+    "revision": null
+  }, {
+    "url": "assets/html2canvas.esm-QH1iLAAe.js",
+    "revision": null
+  }, {
+    "url": "apple-touch-icon.png",
+    "revision": "4d8c575f03b6f7560a6a0fb1638e05ad"
+  }, {
+    "url": "favicon.png",
+    "revision": "e79abea7ff423054bf9a4d599f998741"
+  }, {
+    "url": "pwa-192x192.png",
+    "revision": "e45b594593d397a3503fdccd3301f723"
+  }, {
+    "url": "pwa-512x512.png",
+    "revision": "95f29def35b6afe4b77bead83d814e15"
+  }, {
+    "url": "manifest.webmanifest",
+    "revision": "5adb7286e79ceddccea90435dcd4c5d1"
+  }], {});
+  workbox.cleanupOutdatedCaches();
+  workbox.registerRoute(new workbox.NavigationRoute(workbox.createHandlerBoundToURL("index.html"), {
+    denylist: [/^\/share(?:\/|$)/]
+  }));
+  workbox.registerRoute(/^https:\/\/cdn\.tailwindcss\.com\/.*/i, new workbox.CacheFirst({
+    "cacheName": "tailwindcss-cache",
+    plugins: [new workbox.ExpirationPlugin({
+      maxEntries: 10,
+      maxAgeSeconds: 31536000
+    }), new workbox.CacheableResponsePlugin({
+      statuses: [0, 200]
+    })]
+  }), 'GET');
+
+}));
