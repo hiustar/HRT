@@ -28,7 +28,7 @@ const STOCKABLE: Record<'transfem' | 'transmasc', [Route, Ester][]> = {
         [Route.injection, Ester.LEUP], [Route.injection, Ester.TRIP],
         [Route.oral, Ester.EV], [Route.oral, Ester.E2], [Route.oral, Ester.CPA],
         [Route.oral, Ester.SPIRO], [Route.oral, Ester.BICA], [Route.oral, Ester.MPA], [Route.oral, Ester.RLX],
-        [Route.sublingual, Ester.E2], [Route.gel, Ester.E2], [Route.patchApply, Ester.E2],
+        [Route.sublingual, Ester.E2], [Route.sublingualNew, Ester.E2], [Route.sublingualNew, Ester.EV], [Route.gel, Ester.E2], [Route.patchApply, Ester.E2],
     ],
     transmasc: [
         [Route.injection, Ester.TC], [Route.injection, Ester.TE], [Route.injection, Ester.TU],

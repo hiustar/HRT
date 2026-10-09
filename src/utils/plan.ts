@@ -53,6 +53,7 @@ export const PLAN_DRUGS: Record<'transfem' | 'transmasc', Partial<Record<Route, 
         [Route.injection]: [Ester.EV, Ester.EB, Ester.EC, Ester.EN, Ester.EU, Ester.LEUP, Ester.TRIP],
         [Route.oral]: [Ester.EV, Ester.E2, Ester.CPA, Ester.SPIRO, Ester.BICA, Ester.MPA, Ester.RLX],
         [Route.sublingual]: [Ester.E2, Ester.EV],
+        [Route.sublingualNew]: [Ester.E2, Ester.EV],
         [Route.gel]: [Ester.E2],
         [Route.patchApply]: [Ester.E2],
     },
@@ -104,7 +105,7 @@ export const draftToItem = (d: PlanDraft, id: string): PlanItem | null => {
     const isPatch = d.route === Route.patchApply;
     const extras: PlanItem['extras'] =
         isPatch ? { [ExtraKey.releaseRateUGPerDay]: dose, [ExtraKey.patchWearH]: f.everyDays * 24 }
-        : d.route === Route.sublingual ? { [ExtraKey.sublingualTier]: d.slTier }
+        : (d.route === Route.sublingual || d.route === Route.sublingualNew) ? { [ExtraKey.sublingualTier]: d.slTier }
         : d.route === Route.gel ? { [ExtraKey.gelSite]: d.gelSite } : {};
     return { id, route: d.route, ester: d.ester, doseMG: isPatch ? 0 : dose, extras, everyDays: f.everyDays, timesPerDay: f.timesPerDay };
 };

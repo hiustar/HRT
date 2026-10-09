@@ -27,6 +27,7 @@ const DRUGS: Record<'transfem' | 'transmasc', Partial<Record<Route, Ester[]>>> =
         [Route.injection]: [Ester.EV, Ester.EB, Ester.EC, Ester.EN, Ester.EU],
         [Route.oral]: [Ester.EV, Ester.E2],
         [Route.sublingual]: [Ester.E2, Ester.EV],
+        [Route.sublingualNew]: [Ester.E2, Ester.EV],
         [Route.gel]: [Ester.E2],
         [Route.patchApply]: [Ester.E2],
     },
@@ -123,7 +124,7 @@ const Forecast: React.FC<ForecastProps> = ({
         const wear = num(d.wearDays);
         const extras: PlanSpec['extras'] =
             d.route === Route.patchApply ? { [ExtraKey.releaseRateUGPerDay]: dose, [ExtraKey.patchWearH]: wear > 0 ? wear * 24 : d.intervalH }
-            : d.route === Route.sublingual ? { [ExtraKey.sublingualTier]: d.slTier }
+            : (d.route === Route.sublingual || d.route === Route.sublingualNew) ? { [ExtraKey.sublingualTier]: d.slTier }
             : d.route === Route.gel ? { [ExtraKey.gelSite]: 0 } : {};
         return { route: d.route, ester: d.ester, doseMG: d.route === Route.patchApply ? 0 : dose, extras, intervalH: d.intervalH, startH: d.startH, replace: d.replace };
     };
@@ -289,7 +290,7 @@ const Forecast: React.FC<ForecastProps> = ({
                             onChange={v => update({ intervalH: Number(v) })}
                             options={intervalOptions.map(h => ({ value: String(h), label: intervalLabel(h, t) }))}
                         />
-                        {active.route === Route.sublingual && (
+                        {(active.route === Route.sublingual || active.route === Route.sublingualNew) && (
                             <CustomSelect label={t('field.sl_absorption')} value={String(active.slTier)} onChange={v => update({ slTier: Number(v) })} options={tierOptions} />
                         )}
                         {active.route === Route.patchApply && (

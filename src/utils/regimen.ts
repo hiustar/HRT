@@ -472,7 +472,7 @@ export const packUnitMG = (p: Pack): number => {
 export const packKindsFor = (route: Route): PackKind[] => {
     switch (route) {
         case Route.injection: return ['vial', 'bulk'];
-        case Route.oral: case Route.sublingual: return ['pill', 'bulk'];
+        case Route.oral: case Route.sublingual: case Route.sublingualNew: return ['pill', 'bulk'];
         case Route.gel: return ['pump', 'sachet', 'bulk'];
         case Route.patchApply: return ['patch'];
         default: return ['bulk'];

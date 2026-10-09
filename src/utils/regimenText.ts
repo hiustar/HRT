@@ -69,7 +69,7 @@ export function frequencyLabel(f: { everyDays: number; timesPerDay: number }, t:
  */
 export function productNames(route: Route, ester: Ester, t: T): string {
     const look = (r: Route) => { const k = `products.${r}.${ester}`; const v = t(k); return v === k ? '' : v; };
-    return look(route) || (route === Route.sublingual ? look(Route.oral) : '');
+    return look(route) || ((route === Route.sublingual || route === Route.sublingualNew) ? look(Route.oral) : '');
 }
 
 /** "戊酸雌二醇 5 mg 肌注", "雌二醇贴片 100 µg/天": the way a prescription line reads. */

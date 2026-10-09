@@ -361,8 +361,11 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
     // through to the chart's "no records" state for as long as the simulation
     // took to run.
     const simulation = useMemo<SimulationResult | null>(
-        () => (events.length > 0 ? runSimulation(events, weight) : null),
-        [events, weight],
+        () => {
+            applyPKOverrides(pkParams);
+            return events.length > 0 ? runSimulation(events, weight) : null;
+        },
+        [events, weight, pkParams],
     );
 
     // What the person is taking now: their plan when they have entered one,
@@ -389,10 +392,11 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
     const dosesKey = doses.map(e => `${e.route}|${e.ester}|${e.doseMG}|${e.timeH}`).join(',');
     const simulationAhead = useMemo<SimulationResult | null>(() => {
         if (!doses.length) return null;
+        applyPKOverrides(pkParams);
         const fromH = Math.min(...doses.map(e => e.timeH)) - 120 * 24;
         return runSimulation([...events.filter(e => e.timeH >= fromH), ...doses], weight);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [dosesKey, events, weight]);
+    }, [dosesKey, events, weight, pkParams]);
 
     // --- Derived State ---
     // Self-learning calibration: fits a personal amplitude (+ clearance, for the
@@ -553,8 +557,16 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
     const deleteQuickDose = (id: string) => setQuickDoses(prev => prev.filter(d => d.id !== id));
 
     const touchPkParams = () => localStorage.setItem(sharedKey('pk-params-at'), String(Date.now()));
-    const setPkParams = (params: PKCustomParams) => { touchPkParams(); setPkParamsState(params); };
-    const clearPkParams = () => { touchPkParams(); setPkParamsState(null); };
+    const setPkParams = (params: PKCustomParams) => {
+        touchPkParams();
+        applyPKOverrides(params);
+        setPkParamsState(params);
+    };
+    const clearPkParams = () => {
+        touchPkParams();
+        applyPKOverrides(null);
+        setPkParamsState(null);
+    };
     const resetPkParams = () => {
         showDialog('confirm', t('pk.reset_confirm'), () => {
             clearPkParams();
