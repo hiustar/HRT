@@ -105,7 +105,7 @@ const SublingualFields: React.FC<SublingualFieldsProps> = ({
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {(ester !== Ester.E2) && (
-                    <div className={`space-y-2 ${(ester === Ester.EV && route === Route.sublingual) ? 'col-span-2' : ''}`}>
+                    <div className={`space-y-2 ${(ester === Ester.EV && (route === Route.sublingual || route === Route.sublingualNew)) ? 'col-span-2' : ''}`}>
                         <label className="block text-xs font-semibold text-[var(--text-muted)] pl-1">{t('field.dose_raw')}</label>
                         <input
                             type="number" inputMode="decimal"
@@ -119,7 +119,7 @@ const SublingualFields: React.FC<SublingualFieldsProps> = ({
                     </div>
                 )}
 
-                {!(ester === Ester.EV && route === Route.sublingual) && ester !== Ester.CPA && (
+                {!(ester === Ester.EV && (route === Route.sublingual || route === Route.sublingualNew)) && ester !== Ester.CPA && (
                     <div className={`space-y-2 ${(ester === Ester.E2) ? "col-span-2" : ""}`}>
                         <label className="block text-xs font-semibold text-[var(--text-muted)] pl-1">
                             {t('field.dose_e2')}
@@ -136,7 +136,7 @@ const SublingualFields: React.FC<SublingualFieldsProps> = ({
                     </div>
                 )}
 
-                {(ester === Ester.EV && route === Route.sublingual) && (
+                {(ester === Ester.EV && (route === Route.sublingual || route === Route.sublingualNew)) && (
                     <div className="col-span-2">
                         <p className="text-xs text-[var(--text-muted)] mt-1 pl-1">
                             {t('field.dose_e2')}: {e2Dose ? `${e2Dose} mg` : '--'}

@@ -2,6 +2,7 @@
 
 export enum Route {
     sublingual = "sublingual",
+    sublingualNew = "sublingualNew",
     injection = "injection",
     patchApply = "patchApply",
     patchRemove = "patchRemove",
@@ -180,7 +181,7 @@ const DOSE_CEILING = {
 } as const;
 
 const _isDailyRoute = (r: Route) =>
-    r === Route.oral || r === Route.sublingual || r === Route.gel || r === Route.patchApply;
+    r === Route.oral || r === Route.sublingual || r === Route.sublingualNew || r === Route.gel || r === Route.patchApply;
 
 /**
  * Largest single-day total dose (mg) within the trailing `days` window for events
@@ -1269,6 +1270,20 @@ export function getBioavailabilityMultiplier(
             }
             return (theta + (1 - theta) * _activePKParams.e2_oral_bio) * mwFactor;
         }
+        case Route.sublingualNew: {
+            let theta = _activePKParams.e2_sl_standard;
+            if (extras[ExtraKey.sublingualTheta] !== undefined) {
+                const customTheta = extras[ExtraKey.sublingualTheta];
+                if (typeof customTheta === 'number' && Number.isFinite(customTheta)) {
+                    theta = Math.min(1, Math.max(0, customTheta));
+                }
+            } else if (extras[ExtraKey.sublingualTier] !== undefined) {
+                const tierIdx = Math.min(SL_TIER_ORDER.length - 1, Math.max(0, Math.round(extras[ExtraKey.sublingualTier]!)));
+                const tierKey = SL_TIER_ORDER[tierIdx] || 'standard';
+                theta = _getSLTheta(tierKey);
+            }
+            return (theta * 0.28 + (1 - theta) * _activePKParams.e2_oral_bio) * mwFactor;
+        }
         case Route.gel: {
             const siteIdx = Math.min(GEL_SITE_ORDER.length - 1, Math.max(0, Math.round(extras[ExtraKey.gelSite] ?? 0)));
             const siteKey = GEL_SITE_ORDER[siteIdx] as GelSite;
@@ -1370,6 +1385,29 @@ function resolveParams(event: DoseEvent): PKParams {
             const k1_slow = event.ester === Ester.EV ? OralPK.kAbsEV : OralPK.kAbsE2;
             const k2 = EsterPK.k2[event.ester] ?? 0;
             const F_fast = toE2;
+            const F_slow = _activePKParams.e2_oral_bio * toE2;
+            const F = theta * F_fast + (1 - theta) * F_slow;
+            return { Frac_fast: theta, k1_fast, k1_slow, k2, k3: defaultK3, F, rateMGh: 0, F_fast, F_slow };
+        }
+        case Route.sublingualNew: {
+            let theta = _activePKParams.e2_sl_standard;
+            if (extras[ExtraKey.sublingualTheta] !== undefined) {
+                const customTheta = extras[ExtraKey.sublingualTheta];
+                if (typeof customTheta === 'number' && Number.isFinite(customTheta)) {
+                    theta = Math.min(1, Math.max(0, customTheta));
+                }
+            } else if (extras[ExtraKey.sublingualTier] !== undefined) {
+                const tierRaw = extras[ExtraKey.sublingualTier];
+                if (typeof tierRaw === 'number' && Number.isFinite(tierRaw)) {
+                    const tierIdx = Math.min(SL_TIER_ORDER.length - 1, Math.max(0, Math.round(tierRaw)));
+                    const tierKey = SL_TIER_ORDER[tierIdx] || 'standard';
+                    theta = _getSLTheta(tierKey);
+                }
+            }
+            const k1_fast = 2.4;
+            const k1_slow = 0.25;
+            const k2 = 0; // 生理修正：血液羧酸酯酶极速水解，无慢水解阻碍
+            const F_fast = toE2 * 0.28; // 组织再分布校准
             const F_slow = _activePKParams.e2_oral_bio * toE2;
             const F = theta * F_fast + (1 - theta) * F_slow;
             return { Frac_fast: theta, k1_fast, k1_slow, k2, k3: defaultK3, F, rateMGh: 0, F_fast, F_slow };
@@ -1600,6 +1638,19 @@ class PrecomputedEventModel {
 
                     // Swallowed (gut) fraction follows oral simplified path, so no extra k2 hydrolysis here.
                     const slowAmount = _analytic2C(tau, doseS, params.F_slow, params.k1_slow, params.k3);
+
+                    return fastAmount + slowAmount;
+                };
+                break;
+            case Route.sublingualNew:
+                this.model = (timeH: number) => {
+                    const tau = timeH - startTime;
+                    if (tau < 0) return 0;
+                    const doseF = dose * params.Frac_fast;
+                    const doseS = dose * (1.0 - params.Frac_fast);
+
+                    const fastAmount = _analytic2C(tau, doseF, params.F_fast, params.k1_fast, params.k3);
+                    const slowAmount = _analytic2C(tau, doseS, params.F_slow, params.k1_slow, 0.12);
 
                     return fastAmount + slowAmount;
                 };

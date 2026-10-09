@@ -38,6 +38,7 @@ type DoseGuideConfig = {
 const DOSE_GUIDE_CONFIG: Partial<Record<Route, DoseGuideConfig>> = {
     [Route.oral]: { unitKey: 'mg_day', thresholds: [2, 4, 8, 12] },
     [Route.sublingual]: { unitKey: 'mg_day', thresholds: [1, 2, 4, 6] },
+    [Route.sublingualNew]: { unitKey: 'mg_day', thresholds: [1, 2, 4, 6] },
     [Route.patchApply]: { unitKey: 'ug_day', thresholds: [100, 200, 400, 600], requiresRate: true },
     [Route.gel]: { unitKey: 'mg_day', thresholds: [1.5, 3, 6, 9] },
 };
@@ -165,7 +166,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
     const [lastEditedField, setLastEditedField] = useState<'raw' | 'bio'>('bio');
 
     const slExtras = useMemo(() => {
-        if (route !== Route.sublingual) return null;
+        if (route !== Route.sublingual && route !== Route.sublingualNew) return null;
         if (useCustomTheta) {
             const theta = thetaFromHold(customHoldValue);
             return { [ExtraKey.sublingualTheta]: theta };
@@ -211,7 +212,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
                 }
             }
 
-            if (eventToEdit.route === Route.sublingual) {
+            if (eventToEdit.route === Route.sublingual || eventToEdit.route === Route.sublingualNew) {
                 if (eventToEdit.extras[ExtraKey.sublingualTier] !== undefined) {
                     setSlTier(eventToEdit.extras[ExtraKey.sublingualTier]);
                     setUseCustomTheta(false);
@@ -335,7 +336,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
             createdAt: Date.now()
         };
 
-        if (route === Route.sublingual && slExtras) {
+        if ((route === Route.sublingual || route === Route.sublingualNew) && slExtras) {
             Object.assign(template.extras, slExtras);
         }
         if (route === Route.gel) {
@@ -380,7 +381,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
             setPatchWearDays(typeof wearH === 'number' && Number.isFinite(wearH) && wearH > 0 ? (wearH / 24).toString() : "");
         }
 
-        if (template.route === Route.sublingual) {
+        if (template.route === Route.sublingual || template.route === Route.sublingualNew) {
             if (template.extras[ExtraKey.sublingualTier] !== undefined) {
                 setSlTier(template.extras[ExtraKey.sublingualTier]);
                 setUseCustomTheta(false);
@@ -426,7 +427,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
         const extras: any = {};
         const nonPositiveMsg = t('error.nonPositive');
 
-        if (route === Route.sublingual && useCustomTheta) {
+        if ((route === Route.sublingual || route === Route.sublingualNew) && useCustomTheta) {
             if (!Number.isFinite(customHoldValue) || customHoldValue < 1) {
                 failSave(t('error.slHoldMinOne'));
                 return;
@@ -470,7 +471,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
             }
         }
 
-        if (route === Route.sublingual && slExtras) {
+        if ((route === Route.sublingual || route === Route.sublingualNew) && slExtras) {
             Object.assign(extras, slExtras);
         }
 
@@ -523,6 +524,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
             case Route.oral:
                 return [Ester.E2, Ester.EV, Ester.CPA, Ester.SPIRO, Ester.BICA, Ester.MPA, Ester.RLX];
             case Route.sublingual:
+            case Route.sublingualNew:
                 return [Ester.E2, Ester.EV];
             default:
                 return [Ester.E2];
@@ -538,7 +540,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
             // Transmasc: no oral/sublingual; no patches (T patches are uncommon and
             // not realistically modeled with the current µg/day scheme).
             return Object.values(Route).filter(r =>
-                r !== Route.oral && r !== Route.sublingual &&
+                r !== Route.oral && r !== Route.sublingual && r !== Route.sublingualNew &&
                 r !== Route.patchApply && r !== Route.patchRemove
             );
         }
@@ -795,7 +797,7 @@ const DoseForm: React.FC<DoseFormProps> = ({ eventToEdit, onSave, onCancel, onDe
                                 />
                             )}
 
-                            {route === Route.sublingual && (
+                            {(route === Route.sublingual || route === Route.sublingualNew) && (
                                 <SublingualFields
                                     ester={ester}
                                     rawDose={rawDose}

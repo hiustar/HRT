@@ -41,6 +41,13 @@ const DRAWINGS: Partial<Record<DoodleName, React.ReactNode>> = {
         </g>
     ),
     // A scored tablet, beginning to dissolve.
+    [Route.sublingualNew]: (
+        <>
+            <path className={WASH} stroke="none" d="M20.2 12.6 C 26 12.4, 30.4 16.6, 30.2 22.2 C 30.4 27.8, 26 32, 20.2 31.8 C 14.4 32, 10 27.8, 10.2 22.2 C 10 16.6, 14.4 12.4, 20.2 12.6 Z" />
+            <Line d="M20.2 12.6 C 26 12.4, 30.4 16.6, 30.2 22.2 C 30.4 27.8, 26 32, 20.2 31.8 C 14.4 32, 10 27.8, 10.2 22.2 C 10 16.6, 14.4 12.4, 20.6 12.7" />
+            <Line d="M11.4 22.4 C 16 21.8, 25 22.4, 29 21.9" w={1.6} />
+        </>
+    ),
     [Route.sublingual]: (
         <>
             <path className={WASH} stroke="none" d="M20.2 12.6 C 26 12.4, 30.4 16.6, 30.2 22.2 C 30.4 27.8, 26 32, 20.2 31.8 C 14.4 32, 10 27.8, 10.2 22.2 C 10 16.6, 14.4 12.4, 20.2 12.6 Z" />
