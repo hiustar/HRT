@@ -45,6 +45,7 @@ export default defineConfig(() => {
           ]
         },
         workbox: {
+          mode: "development",
           // Shared pages require the network API and should always load the
           // current application shell instead of an older precached shell.
           navigateFallbackDenylist: [/^\/share(?:\/|$)/],

@@ -57,7 +57,7 @@ const AUTH_TABS = ['sign-in', 'sign-up'] as const;
  * every backup this device would otherwise write.
  */
 type UnlockTarget =
-    | { purpose: 'expand'; rawData: any; backupId: string }
+    | { purpose: 'expand'; rawData: any; backupId: string; backupUserId?: string }
     | { purpose: 'sync' };
 
 const SyncIcon: React.FC<{ status: SyncStatus; className?: string }> = ({ status, className }) => {
@@ -180,7 +180,7 @@ const Account: React.FC<AccountProps> = ({
                 // Encrypted but no key on this device — ask for the password.
                 setExpandLoading(null);
                 setUnlockError(null);
-                setUnlockTarget({ purpose: 'expand', rawData: backup.data, backupId: b.id });
+                setUnlockTarget({ purpose: 'expand', rawData: backup.data, backupId: b.id, backupUserId: (backup as any).user_id });
             } else {
                 showDialog('alert', t('account.load_backup_failed'));
                 setExpandedId(null);
@@ -237,23 +237,27 @@ const Account: React.FC<AccountProps> = ({
             ? metas.reduce((a, b) => (b.created_at > a.created_at ? b : a))
             : null;
 
+        let unlockedSuccess = false;
         if (newest) {
             const backup = await cloudService.loadOne(token, newest.id);
-            const res = await unlockCloudBackup(backup.data, password, user.id);
-            // `locked` here means ciphertext that stayed shut — a wrong password,
-            // or an origin where the key cannot be derived at all.
-            if (res.status === 'locked') { setUnlockError(t('account.unlock_failed')); return; }
+            const res = await unlockCloudBackup(backup.data, password, user.id, (backup as any)?.user_id);
+            if (res.status === 'ok') {
+                unlockedSuccess = true;
+            }
         }
-        // Nothing decrypted, so nothing has vouched for the password yet.
+        // 关键死锁修复：如果最新备份是用旧密码加密的，而用户输入的是当前有效密码：
+        // 只要当前密码在服务器校验通过，就成功解锁并生成当前密钥，解除同步锁定！
         if (!hasCloudKey()) {
-            if (!(await passwordIsCurrent(password))) {
-                setUnlockError(t('account.unlock_failed'));
-                return;
+            const currentValid = await passwordIsCurrent(password);
+            if (currentValid) {
+                await deriveAndCacheCloudKey(password, user.id);
+                unlockedSuccess = true;
             }
-            if (!(await deriveAndCacheCloudKey(password, user.id))) {
-                setUnlockError(t('account.unlock_failed'));
-                return;
-            }
+        }
+
+        if (!unlockedSuccess) {
+            setUnlockError(t('account.unlock_failed'));
+            return;
         }
         setUnlockTarget(null);
     };
@@ -267,7 +271,7 @@ const Account: React.FC<AccountProps> = ({
                 await unlockSync(password);
                 return;
             }
-            const res = await unlockCloudBackup(unlockTarget.rawData, password, user.id);
+            const res = await unlockCloudBackup(unlockTarget.rawData, password, user.id, (unlockTarget as any).backupUserId);
             if (res.status === 'ok') {
                 setExpandedData(prev => ({ ...prev, [unlockTarget.backupId]: normalizeBackupPayload(res.data) }));
                 setExpandedId(unlockTarget.backupId);
