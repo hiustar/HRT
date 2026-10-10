@@ -257,6 +257,41 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 conn.close()
                 return self.send_json({'message': 'Passkey registered', 'id': pk_id, 'backupCodes': []}, 201)
 
+            # 通行密钥免密登录选项: POST /api/auth/passkey-options
+            if path == '/api/auth/passkey-options':
+                data = self.read_json_body()
+                username = (data.get('username') or '').strip()
+                origin = self.headers.get('Origin', '') or f'http://{self.headers.get("Host", "localhost")}'
+                try:
+                    rp_id = urllib.parse.urlparse(origin).hostname or 'localhost'
+                except Exception:
+                    rp_id = 'localhost'
+                challenge = b64url_encode(os.urandom(32))
+
+                credential_ids = []
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                if username:
+                    c.execute('SELECT id FROM users WHERE username = ? COLLATE NOCASE', (username,))
+                    urow = c.fetchone()
+                    if urow:
+                        c.execute('SELECT credential_id FROM passkeys WHERE user_id = ?', (urow[0],))
+                        credential_ids = [r[0] for r in c.fetchall()]
+                else:
+                    c.execute('SELECT credential_id FROM passkeys')
+                    credential_ids = [r[0] for r in c.fetchall()]
+                conn.close()
+
+                challenge_token = make_token("auth", username or "any", f"challenge_{challenge}")
+                return self.send_json({
+                    'challengeToken': challenge_token,
+                    'challenge': challenge,
+                    'credentialIds': credential_ids,
+                    'rpId': rp_id,
+                    'timeout': 60000,
+                    'userVerification': 'preferred'
+                })
+
             # 通行密钥免密登录验证: POST /api/auth/passkey-verify
             if path == '/api/auth/passkey-verify':
                 data = self.read_json_body()
@@ -492,9 +527,12 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 c = conn.cursor()
                 c.execute('SELECT totp_secret FROM users WHERE id = ?', (auth_user['user_id'],))
                 row = c.fetchone()
+                c.execute('SELECT COUNT(*) FROM passkeys WHERE user_id = ?', (auth_user['user_id'],))
+                pk_cnt = c.fetchone()[0]
                 conn.close()
                 has_totp = bool(row and row[0])
-                return self.send_json({"enabled": has_totp, "totp": has_totp, "passkey": False})
+                has_passkey = bool(pk_cnt > 0)
+                return self.send_json({"enabled": has_totp or has_passkey, "totp": has_totp, "passkey": has_passkey})
 
             # 3. 2FA 设置密钥申请: GET /api/user/2fa/setup
             if path == '/api/user/2fa/setup':
@@ -549,14 +587,34 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
 
             # 通行密钥免密登录选项: GET /api/auth/passkey-options
             if path == '/api/auth/passkey-options':
+                query = urllib.parse.parse_qs(url.query)
+                username = (query.get('username', [''])[0]).strip()
                 origin = self.headers.get('Origin', '') or f'http://{self.headers.get("Host", "localhost")}'
                 try:
                     rp_id = urllib.parse.urlparse(origin).hostname or 'localhost'
-                except:
+                except Exception:
                     rp_id = 'localhost'
                 challenge = b64url_encode(os.urandom(32))
+
+                credential_ids = []
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                if username:
+                    c.execute('SELECT id FROM users WHERE username = ? COLLATE NOCASE', (username,))
+                    urow = c.fetchone()
+                    if urow:
+                        c.execute('SELECT credential_id FROM passkeys WHERE user_id = ?', (urow[0],))
+                        credential_ids = [r[0] for r in c.fetchall()]
+                else:
+                    c.execute('SELECT credential_id FROM passkeys')
+                    credential_ids = [r[0] for r in c.fetchall()]
+                conn.close()
+
+                challenge_token = make_token("auth", username or "any", f"challenge_{challenge}")
                 return self.send_json({
+                    'challengeToken': challenge_token,
                     'challenge': challenge,
+                    'credentialIds': credential_ids,
                     'rpId': rp_id,
                     'timeout': 60000,
                     'userVerification': 'preferred'
