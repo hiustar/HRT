@@ -806,13 +806,15 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 setDoseTemplates(newTemplates);
             }
             // 导入恢复用药方案与耗材
-            if (Array.isArray(parsed.plan)) {
-                const newPlan = parsed.plan.map(normalizePlanItem).filter((x: any): x is PlanItem => x !== null);
+            const rawPlan = parsed?.plan || parsed?.modes?.[mode]?.plan;
+            if (Array.isArray(rawPlan)) {
+                const newPlan = rawPlan.map(normalizePlanItem).filter((x: any): x is PlanItem => x !== null);
                 localStorage.setItem(keyFor(mode, 'plan'), JSON.stringify(newPlan));
                 setPlan(newPlan);
             }
-            if (Array.isArray(parsed.supplies)) {
-                const newSupplies = parsed.supplies.map(normalizeSupply).filter((x: any): x is Supply => x !== null);
+            const rawSupplies = parsed?.supplies || parsed?.modes?.[mode]?.supplies;
+            if (Array.isArray(rawSupplies)) {
+                const newSupplies = rawSupplies.map(normalizeSupply).filter((x: any): x is Supply => x !== null);
                 localStorage.setItem(keyFor(mode, 'supplies'), JSON.stringify(newSupplies));
                 setSupplies(newSupplies);
             }
@@ -955,6 +957,26 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 if (newOnes.length > 0) setDoseTemplates(prev => [...prev, ...newOnes]);
             }
 
+            // 合并用药方案与耗材
+            const rawPlan = parsed?.plan || parsed?.modes?.[mode]?.plan;
+            if (Array.isArray(rawPlan)) {
+                const newPlan = rawPlan.map(normalizePlanItem).filter((x: any): x is PlanItem => x !== null);
+                const existingIds = new Set(plan.map(i => i.id));
+                const toAdd = newPlan.filter(i => !existingIds.has(i.id));
+                const mergedPlan = [...plan, ...toAdd];
+                localStorage.setItem(keyFor(mode, 'plan'), JSON.stringify(mergedPlan));
+                setPlan(mergedPlan);
+            }
+            const rawSupplies = parsed?.supplies || parsed?.modes?.[mode]?.supplies;
+            if (Array.isArray(rawSupplies)) {
+                const newSupplies = rawSupplies.map(normalizeSupply).filter((x: any): x is Supply => x !== null);
+                const existingIds = new Set(supplies.map(s => s.id));
+                const toAdd = newSupplies.filter(s => !existingIds.has(s.id));
+                const mergedSupplies = [...supplies, ...toAdd];
+                localStorage.setItem(keyFor(mode, 'supplies'), JSON.stringify(mergedSupplies));
+                setSupplies(mergedSupplies);
+            }
+
             showDialog('alert', (t('account.merge_success') as string).replace('{n}', String(merged)));
             return true;
         } catch (err) {
@@ -969,31 +991,28 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             events: loadJSON<DoseEvent[]>(keyFor(m, 'events'), []),
             labResults: loadJSON<LabResult[]>(keyFor(m, 'lab-results'), []),
             doseTemplates: loadJSON<DoseTemplate[]>(keyFor(m, 'dose-templates'), []),
+            plan: loadJSON<PlanItem[]>(keyFor(m, 'plan'), []),
+            supplies: loadJSON<unknown[]>(keyFor(m, 'supplies'), []).map(normalizeSupply).filter((x): x is Supply => x !== null),
             deletions: readTombstones(m),
         });
-        const modes = {
+        const modes: any = {
             transfem: readMode('transfem'),
             transmasc: readMode('transmasc'),
         };
         // Overlay current in-memory state for the active mode.
-        modes[mode] = { events, labResults, doseTemplates, deletions: readTombstones(mode) };
+        modes[mode] = { events, labResults, doseTemplates, plan, supplies, deletions: readTombstones(mode) };
 
         return {
             meta: { version: 2, exportedAt: new Date().toISOString() },
             mode,
             weight,
-            // Last-write stamps for the two values sync can't merge per record.
-            // Missing on payloads written before sync existed, which is exactly
-            // how they should lose to a stamped one.
             weightUpdatedAt: Number(localStorage.getItem(sharedKey('weight-at'))) || undefined,
             modes,
-            // Flat v1-compatible fields mirror the currently active mode.
             events,
             labResults,
             doseTemplates,
-            // PK parameter overrides. Explicitly `null` when the user cleared
-            // them — omitting the key would read as "this payload says nothing
-            // about PK params", and the cleared state would never propagate.
+            plan,
+            supplies,
             pkParams: pkParams ?? null,
             pkParamsUpdatedAt: Number(localStorage.getItem(sharedKey('pk-params-at'))) || undefined,
         };

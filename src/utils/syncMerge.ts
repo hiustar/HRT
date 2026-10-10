@@ -478,6 +478,8 @@ export function fingerprintState(state: SyncState): string {
             parts.push(`${m}.${kind}:${rows.join(';')}`);
             parts.push(`${m}.${kind}.del:${Object.keys(block.deletions[kind]).sort().join(';')}`);
         }
+        parts.push(`${m}.plan:${JSON.stringify(block.plan || [])}`);
+        parts.push(`${m}.supplies:${JSON.stringify(block.supplies || [])}`);
     }
     parts.push(`weight:${state.weight === undefined ? '' : stableString(state.weight)}`);
     parts.push(`pkParams:${state.pkParams === undefined ? '' : stableString(state.pkParams)}`);
