@@ -198,6 +198,8 @@ const AppContent = () => {
         doseTemplates,
         weight,
         pkParams,
+        plan,
+        supplies,
     });
 
     // --- Theme Effect ---

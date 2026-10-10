@@ -104,6 +104,8 @@ interface Options {
     doseTemplates: unknown;
     weight: unknown;
     pkParams: unknown;
+    plan?: unknown;
+    supplies?: unknown;
 }
 
 /** Debounce before pushing a local edit, long enough to absorb a burst of them. */
@@ -154,7 +156,7 @@ type RemoteRead =
 
 export const useCloudSync = ({
     token, userId, enabled, ready, buildPayload, applyRemote,
-    events, labResults, doseTemplates, weight, pkParams,
+    events, labResults, doseTemplates, weight, pkParams, plan, supplies,
 }: Options): CloudSyncState => {
     // The reported half of the state. `syncNow` is grafted on at the end so
     // the setters below stay plain data.
@@ -482,7 +484,7 @@ export const useCloudSync = ({
             if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [events, labResults, doseTemplates, weight, pkParams]);
+    }, [events, labResults, doseTemplates, weight, pkParams, plan, supplies]);
 
     const syncNow = useCallback(async () => {
         const outcome = await runSync(true);
@@ -508,6 +510,8 @@ function toPayload(localPayload: any, merged: SyncState): any {
         events: active.events,
         labResults: active.labResults,
         doseTemplates: active.doseTemplates,
+        plan: active.plan,
+        supplies: active.supplies,
         pkParams: merged.pkParams ?? null,
         pkParamsUpdatedAt: merged.pkParamsUpdatedAt || undefined,
     };

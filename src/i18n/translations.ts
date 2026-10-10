@@ -416,9 +416,6 @@ export const TRANSLATIONS_BASE = {
         "route.oral": "口服 (Oral)",
         "route.sublingual": "舌下 (Sublingual)",
         "route.sublingualNew": "新版舌下",
-        "regimen.route.sublingualNew": "新版舌下",
-        "plan.verb.sublingualNew": "服用",
-        "plan.done.sublingualNew": "服用了",
         "route.gel": "凝胶",
 
         "gel.site.arm": "手臂 (Arm)",
@@ -1306,9 +1303,6 @@ export const TRANSLATIONS_BASE = {
         "route.oral": "Oral",
         "route.sublingual": "Sublingual",
         "route.sublingualNew": "Sublingual (New)",
-        "regimen.route.sublingualNew": "Sublingual (New)",
-        "plan.verb.sublingualNew": "take",
-        "plan.done.sublingualNew": "Took it",
         "route.gel": "Gel",
 
         "gel.site.arm": "Arm",
@@ -2957,9 +2951,6 @@ export const TRANSLATIONS = {
         "route.oral": "口服 (Oral)",
         "route.sublingual": "舌下 (Sublingual)",
         "route.sublingualNew": "新版舌下",
-        "regimen.route.sublingualNew": "新版舌下",
-        "plan.verb.sublingualNew": "服用",
-        "plan.done.sublingualNew": "服用了",
         "route.gel": "凝膠",
 
         "gel.site.arm": "手臂 (Arm)",
@@ -3547,9 +3538,6 @@ export const TRANSLATIONS = {
         "route.oral": "経口 (Oral)",
         "route.sublingual": "舌下 (Sublingual)",
         "route.sublingualNew": "新版舌下",
-        "regimen.route.sublingualNew": "新版舌下",
-        "plan.verb.sublingualNew": "服用",
-        "plan.done.sublingualNew": "服用了",
         "route.gel": "ジェル",
 
         "gel.site.arm": "腕 (Arm)",

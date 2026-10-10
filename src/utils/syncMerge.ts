@@ -44,6 +44,8 @@ export interface ModeBlock {
     events: any[];
     labResults: any[];
     doseTemplates: any[];
+    plan: any[];
+    supplies: any[];
     deletions: Tombstones;
 }
 
@@ -98,7 +100,7 @@ export function emptyTombstones(): Tombstones {
 }
 
 function emptyModeBlock(): ModeBlock {
-    return { events: [], labResults: [], doseTemplates: [], deletions: emptyTombstones() };
+    return { events: [], labResults: [], doseTemplates: [], plan: [], supplies: [], deletions: emptyTombstones() };
 }
 
 export function emptySyncState(): SyncState {
@@ -188,6 +190,12 @@ function routeFlatPayload(payload: any, modes: Record<ModeKey, ModeBlock>): void
         if (!tpl || typeof tpl !== 'object') continue;
         modes[isTestosteroneEster(tpl.ester) ? 'transmasc' : 'transfem'].doseTemplates.push(tpl);
     }
+    for (const pl of asArray(payload.plan)) {
+        if (pl && typeof pl === 'object') modes['transfem'].plan.push(pl);
+    }
+    for (const sp of asArray(payload.supplies)) {
+        if (sp && typeof sp === 'object') modes['transfem'].supplies.push(sp);
+    }
 }
 
 /** Read any export/backup payload — bare array, flat v1, or v2 `modes` — into a SyncState. */
@@ -212,6 +220,8 @@ export function normalizeSyncState(payload: unknown): SyncState {
                 events: asArray(block.events),
                 labResults: asArray(block.labResults),
                 doseTemplates: asArray(block.doseTemplates),
+                plan: asArray(block.plan),
+                supplies: asArray(block.supplies),
                 deletions: sanitizeTombstones(block.deletions),
             };
         }
@@ -383,10 +393,25 @@ export function mergeSyncStates(local: SyncState, remote: SyncState | null): Mer
             labResults: mergeTombstoneMaps(local.modes[m].deletions.labResults, remote.modes[m].deletions.labResults),
             doseTemplates: mergeTombstoneMaps(local.modes[m].deletions.doseTemplates, remote.modes[m].deletions.doseTemplates),
         };
+        const mergeListById = (localList: any[], remoteList: any[]) => {
+            const map = new Map<string, any>();
+            for (const item of (localList || [])) {
+                if (item && item.id) map.set(item.id, item);
+                else if (item) map.set(JSON.stringify(item), item);
+            }
+            for (const item of (remoteList || [])) {
+                if (item && item.id) map.set(item.id, item);
+                else if (item) map.set(JSON.stringify(item), item);
+            }
+            return Array.from(map.values());
+        };
+
         merged.modes[m] = {
             events: mergeKind('events', local.modes[m].events, remote.modes[m].events, deletions.events, stats),
             labResults: mergeKind('labResults', local.modes[m].labResults, remote.modes[m].labResults, deletions.labResults, stats),
             doseTemplates: mergeKind('doseTemplates', local.modes[m].doseTemplates, remote.modes[m].doseTemplates, deletions.doseTemplates, stats),
+            plan: mergeListById(local.modes[m].plan, remote.modes[m].plan),
+            supplies: mergeListById(local.modes[m].supplies, remote.modes[m].supplies),
             deletions,
         };
     }
@@ -424,6 +449,8 @@ export function hasContent(state: SyncState): boolean {
             if ((block[kind] as any[]).length > 0) return true;
             if (Object.keys(block.deletions[kind]).length > 0) return true;
         }
+        if ((block.plan || []).length > 0) return true;
+        if ((block.supplies || []).length > 0) return true;
     }
     return state.weightUpdatedAt > 1 || state.pkParamsUpdatedAt > 1;
 }
