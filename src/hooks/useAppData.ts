@@ -805,6 +805,17 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 reconcileReplacement(mode, 'doseTemplates', doseTemplates, newTemplates);
                 setDoseTemplates(newTemplates);
             }
+            // 导入恢复用药方案与耗材
+            if (Array.isArray(parsed.plan)) {
+                const newPlan = parsed.plan.map(normalizePlanItem).filter((x: any): x is PlanItem => x !== null);
+                localStorage.setItem(keyFor(mode, 'plan'), JSON.stringify(newPlan));
+                setPlan(newPlan);
+            }
+            if (Array.isArray(parsed.supplies)) {
+                const newSupplies = parsed.supplies.map(normalizeSupply).filter((x: any): x is Supply => x !== null);
+                localStorage.setItem(keyFor(mode, 'supplies'), JSON.stringify(newSupplies));
+                setSupplies(newSupplies);
+            }
             if (newWeight !== undefined) setWeight(newWeight);
             if (newPkParams !== undefined) setPkParams(newPkParams);
 
@@ -1015,6 +1026,21 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             localStorage.setItem(keyFor(block.m, 'events'), JSON.stringify(block.events));
             localStorage.setItem(keyFor(block.m, 'lab-results'), JSON.stringify(block.labResults));
             localStorage.setItem(keyFor(block.m, 'dose-templates'), JSON.stringify(block.doseTemplates));
+
+            // 同步恢复用药方案 (plan)
+            const rawPlan = (state.modes[block.m] as any)?.plan || (block.m === mode ? (state as any).plan : null);
+            if (Array.isArray(rawPlan)) {
+                localStorage.setItem(keyFor(block.m, 'plan'), JSON.stringify(rawPlan));
+                if (block.m === mode) setPlan(rawPlan.map(normalizePlanItem).filter((x): x is PlanItem => x !== null));
+            }
+
+            // 同步恢复耗材库存 (supplies)
+            const rawSupplies = (state.modes[block.m] as any)?.supplies || (block.m === mode ? (state as any).supplies : null);
+            if (Array.isArray(rawSupplies)) {
+                localStorage.setItem(keyFor(block.m, 'supplies'), JSON.stringify(rawSupplies));
+                if (block.m === mode) setSupplies(rawSupplies.map(normalizeSupply).filter((x): x is Supply => x !== null));
+            }
+
             if (block.m === mode) {
                 setEvents(block.events);
                 setLabResults(block.labResults);

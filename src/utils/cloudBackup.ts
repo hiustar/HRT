@@ -154,6 +154,8 @@ export function normalizeBackupPayload(parsed: any): BackupSummary {
                 events: Array.isArray(preferredBlock.events) ? preferredBlock.events : [],
                 labResults: Array.isArray(preferredBlock.labResults) ? preferredBlock.labResults : [],
                 doseTemplates: Array.isArray(preferredBlock.doseTemplates) ? preferredBlock.doseTemplates : [],
+                plan: Array.isArray(preferredBlock.plan) ? preferredBlock.plan : (Array.isArray(parsed.plan) ? parsed.plan : []),
+                supplies: Array.isArray(preferredBlock.supplies) ? preferredBlock.supplies : (Array.isArray(parsed.supplies) ? parsed.supplies : []),
                 weight: typeof parsed.weight === 'number' ? parsed.weight : undefined,
             };
         }
