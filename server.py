@@ -770,7 +770,7 @@ class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 if __name__ == '__main__':
     url = f"http://0.0.0.0:{PORT}"
     print("=" * 60)
-    print(f"🚀 绪山真寻 HRT Tracker 高并发多设备互通服务器已启动！")
+    print(f"🚀 HRT Tracker 服务器已启动！")
     print(f"👉 本地访问地址: http://localhost:{PORT}")
     print(f"👉 局域网/服务器访问: {url}")
     print(f"🗄️ 账户与备份数据库: {DB_PATH} (SQLite 驱动，支持 2FA TOTP & Passkeys)")
