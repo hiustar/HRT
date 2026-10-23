@@ -67,7 +67,7 @@ if (!self.define) {
     });
   };
 }
-define(['./workbox-35c88359'], (function (workbox) { 'use strict';
+define(['./workbox-ca84f546'], (function (workbox) { 'use strict';
 
   self.skipWaiting();
   workbox.clientsClaim();
@@ -82,18 +82,18 @@ define(['./workbox-35c88359'], (function (workbox) { 'use strict';
     "revision": "1872c500de691dce40960bb85481de07"
   }, {
     "url": "index.html",
-    "revision": "c2062e35fee87e1d53aede733b227fa7"
+    "revision": "0f47bc044dd96d5c9036b935358d989f"
   }, {
-    "url": "assets/purify.es-B9ZVCkUG.js",
+    "url": "assets/purify.es-BgtpMKW3.js",
     "revision": null
   }, {
-    "url": "assets/index.es-DmLj0ctG.js",
+    "url": "assets/index.es-Cu-gHa8v.js",
     "revision": null
   }, {
-    "url": "assets/index-D1ndTTB_.js",
+    "url": "assets/index-GtWhCDrf.js",
     "revision": null
   }, {
-    "url": "assets/index-BrQNKb_H.css",
+    "url": "assets/index-BMUlHCMC.css",
     "revision": null
   }, {
     "url": "assets/html2canvas.esm-QH1iLAAe.js",

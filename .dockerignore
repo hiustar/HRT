@@ -7,6 +7,8 @@
 .env.*
 !.env.docker.example
 node_modules
+.venv
+__pycache__
 data
 src-tauri
 logs

@@ -244,11 +244,11 @@ export const authService = {
     },
 
     /** Replaces every existing code, so the worker requires the password. */
-    async generateBackupCodes(token: string, password: string): Promise<string[]> {
+    async generateBackupCodes(token: string, password: string, code?: string): Promise<string[]> {
         const res = await apiFetch('/api/user/2fa/backup-codes/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ password }),
+            body: JSON.stringify({ password, code }),
         });
         if (!res.ok) throw await apiErrorFrom(res);
         const data = await res.json() as { codes: string[] };
@@ -297,22 +297,22 @@ export const authService = {
      * least as sensitive as deleting one — the worker requires the password for
      * both.
      */
-    async registerPasskey(token: string, challengeToken: string, credential: object, deviceName: string | undefined, password: string): Promise<{ backupCodes?: string[] }> {
+    async registerPasskey(token: string, challengeToken: string, credential: object, deviceName: string | undefined, password: string, code?: string): Promise<{ backupCodes?: string[] }> {
         const res = await apiFetch('/api/user/passkey/register', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ challengeToken, credential, deviceName, password }),
+            body: JSON.stringify({ challengeToken, credential, deviceName, password, code }),
         });
         if (!res.ok) throw await apiErrorFrom(res);
         return await res.json() as { backupCodes?: string[] };
     },
 
     /** Removing a passkey weakens the account, so the worker requires the password. */
-    async deletePasskey(token: string, id: string, password: string): Promise<void> {
+    async deletePasskey(token: string, id: string, password: string, code?: string): Promise<void> {
         const res = await apiFetch(`/api/user/passkeys/${id}`, {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ password }),
+            body: JSON.stringify({ password, code }),
         });
         if (!res.ok) throw await apiErrorFrom(res);
     },

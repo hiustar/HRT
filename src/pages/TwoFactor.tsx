@@ -208,19 +208,19 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
         setPwPrompt({ kind: 'backup' });
     };
 
-    const submitPasswordPrompt = async (password: string) => {
+    const submitPasswordPrompt = async (password: string, currentCode?: string) => {
         if (!pwPrompt) return;
         setPwLoading(true);
         setPwError(null);
         try {
             if (pwPrompt.kind === 'backup') {
                 setBackupLoading(true);
-                const codes = await authService.generateBackupCodes(token, password);
+                const codes = await authService.generateBackupCodes(token, password, currentCode);
                 setBackupCodes(codes);
                 setBackupRemaining(codes.length);
             } else if (pwPrompt.kind === 'enable') {
                 setLoading(true);
-                const result = await authService.enable2FA(token, pwPrompt.secret, pwPrompt.code, password);
+                const result = await authService.enable2FA(token, pwPrompt.secret, pwPrompt.code, password, currentCode);
                 setBackupCodes(result.backupCodes ?? []);
                 setBackupRemaining(result.backupCodes?.length ?? 0);
                 setTotpEnabled(true);
@@ -228,7 +228,7 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
             } else if (pwPrompt.kind === 'register') {
                 setRegisterLoading(true);
                 const result = await authService.registerPasskey(
-                    token, pwPrompt.challengeToken, pwPrompt.credential, pwPrompt.deviceName, password,
+                    token, pwPrompt.challengeToken, pwPrompt.credential, pwPrompt.deviceName, password, currentCode,
                 );
                 // Registering the first passkey mints backup codes that exist
                 // only in this response. Dropping them left a passkey-only user
@@ -243,7 +243,7 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
             } else {
                 const pk = pwPrompt.passkey;
                 setDeleteLoadingId(pk.id);
-                await authService.deletePasskey(token, pk.id, password);
+                await authService.deletePasskey(token, pk.id, password, currentCode);
                 const left = passkeys.filter(p => p.id !== pk.id);
                 setPasskeys(left);
                 // Dropping the last passkey can take the account back to a
@@ -256,7 +256,7 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
             const code = apiErrorCode(e);
             // The password prompt stays up for a wrong (or missing) password;
             // anything else closes it and reports on the section it came from.
-            if (code === 'INVALID_CREDENTIALS' || (code === 'INVALID_REQUEST' && msg.includes('password is required'))) {
+            if (code === 'INVALID_CREDENTIALS' || code === 'TWO_FACTOR_INVALID' || (code === 'INVALID_REQUEST' && msg.includes('password is required'))) {
                 setPwError(t('account.2fa_verify_failed'));
             } else {
                 setPwPrompt(null);
@@ -659,6 +659,7 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
                 }
                 error={pwError}
                 loading={pwLoading}
+                requireCode={totpEnabled === true}
                 masked
             />
         </div>

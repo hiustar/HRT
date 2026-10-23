@@ -11,12 +11,29 @@ import urllib.parse
 import hmac
 import struct
 import traceback
+import secrets
+import re
+from contextlib import closing
+
+from webauthn import verify_registration_response, verify_authentication_response
+from webauthn.helpers import base64url_to_bytes
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("PORT", 3000))
 PERSIST_DIR = os.environ.get("PERSIST_DIR", BASE_DIR)
 DIST_DIR = os.path.join(BASE_DIR, "dist")
 DB_PATH = os.path.join(PERSIST_DIR, "hrt_server.db")
+SESSION_MAX_AGE = 7 * 86400
+SESSION_IDLE_TIMEOUT = 3 * 86400
+CHALLENGE_MAX_AGE = 300
+PUBLIC_APP_ORIGIN = os.environ.get("PUBLIC_APP_ORIGIN", f"http://localhost:{PORT}").rstrip('/')
+_app_url = urllib.parse.urlsplit(PUBLIC_APP_ORIGIN)
+if (_app_url.scheme not in ('http', 'https') or not _app_url.hostname
+        or _app_url.username or _app_url.password or _app_url.path
+        or _app_url.query or _app_url.fragment
+        or (_app_url.scheme == 'http' and _app_url.hostname not in ('localhost', '127.0.0.1', '::1'))):
+    raise ValueError('PUBLIC_APP_ORIGIN must be an HTTPS origin (HTTP is only allowed for localhost)')
+RP_ID = _app_url.hostname
 
 # --- 数据库初始化与自动结构热升级 ---
 def init_db():
@@ -73,6 +90,33 @@ def init_db():
             data_size INTEGER
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS webauthn_challenges (
+            token TEXT PRIMARY KEY,
+            purpose TEXT NOT NULL,
+            user_id TEXT,
+            challenge TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            rp_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+    ''')
+    c.execute('PRAGMA table_info(passkeys)')
+    passkey_cols = {row[1] for row in c.fetchall()}
+    if 'public_key' not in passkey_cols:
+        c.execute('ALTER TABLE passkeys ADD COLUMN public_key TEXT')
+        c.execute('ALTER TABLE passkeys ADD COLUMN sign_count INTEGER NOT NULL DEFAULT 0')
+    c.execute('PRAGMA table_info(sessions)')
+    if 'auth_version' not in {row[1] for row in c.fetchall()}:
+        c.execute('ALTER TABLE sessions ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0')
+        # Sessions issued before verified passkey authentication cannot be trusted.
+        c.execute('DELETE FROM sessions')
+    c.execute('CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    c.execute('INSERT OR IGNORE INTO server_settings (key, value) VALUES (?, ?)',
+              ('session_signing_key', secrets.token_hex(32)))
+    global SESSION_SIGNING_KEY
+    SESSION_SIGNING_KEY = bytes.fromhex(c.execute(
+        'SELECT value FROM server_settings WHERE key = ?', ('session_signing_key',)).fetchone()[0])
     conn.commit()
     conn.close()
 
@@ -92,34 +136,67 @@ def make_token(user_id: str, username: str, sid: str) -> str:
         "username": username,
         "sid": sid,
         "iat": int(time.time()),
-        "exp": int(time.time()) + 86400 * 365
+        "exp": int(time.time()) + SESSION_MAX_AGE
     }
     payload = b64url_encode(json.dumps(claims).encode('utf-8'))
-    sig = b64url_encode(hashlib.sha256(f"{header}.{payload}.hrt_secret_key".encode('utf-8')).digest())
+    sig = b64url_encode(hmac.new(SESSION_SIGNING_KEY, f'{header}.{payload}'.encode(), hashlib.sha256).digest())
     return f"{header}.{payload}.{sig}"
+
+
+def create_session(conn, user_id, username):
+    sid = secrets.token_urlsafe(32)
+    token = make_token(user_id, username, sid)
+    now = int(time.time())
+    conn.execute('''INSERT INTO sessions
+        (token, sid, user_id, created_at, last_used, auth_version) VALUES (?, ?, ?, ?, ?, 1)''',
+                 (token, sid, user_id, now, now))
+    return token
 
 def verify_token(token: str):
     if not token:
         return None
     try:
-        parts = token.split('.')
-        if len(parts) != 3:
+        header, payload, signature = token.split('.')
+        expected = b64url_encode(hmac.new(SESSION_SIGNING_KEY, f'{header}.{payload}'.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(signature, expected):
             return None
-        payload_b64 = parts[1]
-        pad = (4 - len(payload_b64) % 4) % 4
-        claims = json.loads(base64.urlsafe_b64decode((payload_b64 + '=' * pad).encode('utf-8')).decode('utf-8'))
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('SELECT user_id, sid FROM sessions WHERE token = ?', (token,))
-        row = c.fetchone()
-        conn.close()
-        
-        if row:
-            return {"user_id": row[0], "username": claims.get("username", "user"), "sid": row[1]}
+        claims = json.loads(base64url_to_bytes(payload))
+        now = int(time.time())
+        with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+            row = conn.execute('''SELECT s.user_id, s.sid, s.created_at, s.last_used, u.username
+                FROM sessions s JOIN users u ON u.id = s.user_id
+                WHERE s.token = ? AND s.auth_version = 1''', (token,)).fetchone()
+            if not row:
+                return None
+            if (claims.get('sub') != row[0] or claims.get('sid') != row[1]
+                    or not isinstance(claims.get('exp'), (int, float)) or claims['exp'] <= now
+                    or row[2] + SESSION_MAX_AGE <= now or row[3] + SESSION_IDLE_TIMEOUT <= now):
+                conn.execute('DELETE FROM sessions WHERE token = ?', (token,))
+                return None
+            conn.execute('UPDATE sessions SET last_used = ? WHERE token = ?', (now, token))
+            return {"user_id": row[0], "username": row[4], "sid": row[1]}
+    except (ValueError, TypeError, UnicodeError):
         return None
-    except Exception:
-        return None
+
+
+def create_challenge(conn, purpose, user_id=None):
+    token = secrets.token_urlsafe(32)
+    challenge = b64url_encode(os.urandom(32))
+    now = int(time.time())
+    conn.execute('DELETE FROM webauthn_challenges WHERE expires_at <= ?', (now,))
+    conn.execute('INSERT INTO webauthn_challenges VALUES (?, ?, ?, ?, ?, ?, ?)',
+                 (token, purpose, user_id, challenge, PUBLIC_APP_ORIGIN, RP_ID, now + CHALLENGE_MAX_AGE))
+    return token, challenge
+
+
+def consume_challenge(conn, token, purpose, user_id=None):
+    row = conn.execute('''SELECT user_id, challenge, origin, rp_id FROM webauthn_challenges
+        WHERE token = ? AND purpose = ? AND expires_at > ?''',
+                       (token, purpose, int(time.time()))).fetchone()
+    if not row or (purpose == 'register' and row[0] != user_id):
+        raise ValueError('Invalid or expired challenge')
+    conn.execute('DELETE FROM webauthn_challenges WHERE token = ?', (token,))
+    return row
 
 # --- 双重认证 (TOTP RFC 6238) ---
 def generate_totp_secret() -> str:
@@ -163,6 +240,10 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
         self.send_cors()
+        self.send_header('Cache-Control', 'no-store')
+        if status == 401 and data.get('code') == 'UNAUTHORIZED':
+            self.send_header('X-Session-Invalid', '1')
+            self.send_header('Access-Control-Expose-Headers', 'X-Session-Invalid')
         self.end_headers()
         self.wfile.write(body)
 
@@ -194,6 +275,54 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
             pass
         return {}
 
+    def check_webauthn_origin(self):
+        origin = self.headers.get('Origin')
+        if origin and origin != PUBLIC_APP_ORIGIN:
+            self.send_error_json(400, 'INVALID_REQUEST', 'Untrusted origin')
+            return False
+        return True
+
+    def require_password(self, conn, user_id, data, require_totp=False, code_field='code'):
+        row = conn.execute('SELECT password_hash, salt, totp_secret FROM users WHERE id = ?', (user_id,)).fetchone()
+        password = data.get('password')
+        if (not row or not isinstance(password, str) or not password
+                or not hmac.compare_digest(hash_password(password, row[1]), row[0])):
+            self.send_error_json(401, 'INVALID_CREDENTIALS', 'Current password is required and must be correct')
+            return False
+        if require_totp and row[2] and not verify_totp(row[2], data.get(code_field) or ''):
+            self.send_error_json(401, 'TWO_FACTOR_INVALID', 'Current authenticator code is required')
+            return False
+        return True
+
+    def disable_totp(self):
+        auth_user = self.get_token_user()
+        if not auth_user:
+            return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
+        data = self.read_json_body()
+        with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if not self.require_password(conn, auth_user['user_id'], data, require_totp=True):
+                return
+            conn.execute('UPDATE users SET totp_secret = NULL, backup_codes = NULL WHERE id = ?', (auth_user['user_id'],))
+        return self.send_json({'success': True})
+
+    def passkey_auth_options(self, username):
+        if not self.check_webauthn_origin():
+            return
+        with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+            user_id = None
+            credential_ids = []
+            if username:
+                row = conn.execute('SELECT id FROM users WHERE username = ? COLLATE NOCASE', (username,)).fetchone()
+                # A supplied but unknown account must not become an unrestricted challenge.
+                user_id = row[0] if row else secrets.token_urlsafe(32)
+                credential_ids = [r[0] for r in conn.execute(
+                    'SELECT credential_id FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL', (user_id,))]
+            token, challenge = create_challenge(conn, 'authenticate', user_id)
+        return self.send_json({'challengeToken': token, 'challenge': challenge,
+                               'credentialIds': credential_ids, 'rpId': RP_ID,
+                               'timeout': 60000, 'userVerification': 'preferred'})
+
     def do_POST(self):
         try:
             url = urllib.parse.urlparse(self.path)
@@ -214,23 +343,18 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 auth_user = self.get_token_user()
                 if not auth_user:
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
-                origin = self.headers.get('Origin', '') or f'http://{self.headers.get("Host", "localhost")}'
-                try:
-                    rp_id = urllib.parse.urlparse(origin).hostname or 'localhost'
-                except:
-                    rp_id = 'localhost'
-                challenge = b64url_encode(os.urandom(32))
+                if not self.check_webauthn_origin():
+                    return
                 user_id_encoded = b64url_encode(auth_user['user_id'].encode('utf-8'))
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('SELECT credential_id FROM passkeys WHERE user_id = ?', (auth_user['user_id'],))
-                enrolled = [r[0] for r in c.fetchall()]
-                conn.close()
-                challenge_token = make_token(auth_user['user_id'], auth_user['username'], f'challenge_{challenge}')
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    enrolled = [r[0] for r in conn.execute(
+                        'SELECT credential_id FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL',
+                        (auth_user['user_id'],))]
+                    challenge_token, challenge = create_challenge(conn, 'register', auth_user['user_id'])
                 return self.send_json({
                     'challengeToken': challenge_token,
                     'challenge': challenge,
-                    'rp': {'id': rp_id, 'name': 'HRT Tracker'},
+                    'rp': {'id': RP_ID, 'name': 'HRT Tracker'},
                     'user': {'id': user_id_encoded, 'name': auth_user['username'], 'displayName': auth_user['username']},
                     'pubKeyCredParams': [{'type': 'public-key', 'alg': -7}, {'type': 'public-key', 'alg': -257}],
                     'timeout': 60000,
@@ -244,73 +368,68 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 auth_user = self.get_token_user()
                 if not auth_user:
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
+                if not self.check_webauthn_origin():
+                    return
                 data = self.read_json_body()
-                cred = data.get('credential') or {}
-                device_name = data.get('deviceName') or '通行密钥硬件'
-                cred_id = cred.get('id') or b64url_encode(os.urandom(16))
-                pk_id = f'pk_{int(time.time()*1000)}'
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('INSERT OR REPLACE INTO passkeys (id, user_id, credential_id, device_name, created_at) VALUES (?, ?, ?, ?, ?)',
-                          (pk_id, auth_user['user_id'], cred_id, device_name, int(time.time())))
-                conn.commit()
-                conn.close()
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if not self.require_password(conn, auth_user['user_id'], data, require_totp=True):
+                        return
+                    try:
+                        _, challenge, origin, rp_id = consume_challenge(
+                            conn, data.get('challengeToken'), 'register', auth_user['user_id'])
+                        verified = verify_registration_response(
+                            credential=data.get('credential') or {},
+                            expected_challenge=base64url_to_bytes(challenge),
+                            expected_rp_id=rp_id, expected_origin=origin)
+                    except Exception:
+                        conn.commit()
+                        return self.send_error_json(400, 'INVALID_REQUEST', 'Invalid passkey registration')
+                    pk_id = secrets.token_urlsafe(24)
+                    try:
+                        conn.execute('''INSERT INTO passkeys
+                            (id, user_id, credential_id, device_name, created_at, public_key, sign_count)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                                     (pk_id, auth_user['user_id'], b64url_encode(verified.credential_id),
+                                      data.get('deviceName') or '通行密钥硬件', int(time.time()),
+                                      b64url_encode(verified.credential_public_key), verified.sign_count))
+                    except sqlite3.IntegrityError:
+                        conn.commit()
+                        return self.send_error_json(409, 'CONFLICT', 'Credential already registered')
                 return self.send_json({'message': 'Passkey registered', 'id': pk_id, 'backupCodes': []}, 201)
 
             # 通行密钥免密登录选项: POST /api/auth/passkey-options
             if path == '/api/auth/passkey-options':
                 data = self.read_json_body()
-                username = (data.get('username') or '').strip()
-                origin = self.headers.get('Origin', '') or f'http://{self.headers.get("Host", "localhost")}'
-                try:
-                    rp_id = urllib.parse.urlparse(origin).hostname or 'localhost'
-                except Exception:
-                    rp_id = 'localhost'
-                challenge = b64url_encode(os.urandom(32))
-
-                credential_ids = []
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                if username:
-                    c.execute('SELECT id FROM users WHERE username = ? COLLATE NOCASE', (username,))
-                    urow = c.fetchone()
-                    if urow:
-                        c.execute('SELECT credential_id FROM passkeys WHERE user_id = ?', (urow[0],))
-                        credential_ids = [r[0] for r in c.fetchall()]
-                else:
-                    c.execute('SELECT credential_id FROM passkeys')
-                    credential_ids = [r[0] for r in c.fetchall()]
-                conn.close()
-
-                challenge_token = make_token("auth", username or "any", f"challenge_{challenge}")
-                return self.send_json({
-                    'challengeToken': challenge_token,
-                    'challenge': challenge,
-                    'credentialIds': credential_ids,
-                    'rpId': rp_id,
-                    'timeout': 60000,
-                    'userVerification': 'preferred'
-                })
+                return self.passkey_auth_options((data.get('username') or '').strip())
 
             # 通行密钥免密登录验证: POST /api/auth/passkey-verify
             if path == '/api/auth/passkey-verify':
+                if not self.check_webauthn_origin():
+                    return
                 data = self.read_json_body()
                 cred = data.get('credential') or {}
-                cred_id = cred.get('id')
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('SELECT u.id, u.username FROM users u JOIN passkeys p ON u.id = p.user_id WHERE p.credential_id = ?', (cred_id,))
-                row = c.fetchone()
-                if not row:
-                    conn.close()
-                    return self.send_error_json(401, 'INVALID_CREDENTIALS', '未找到匹配的通行密钥')
-                user_id, username = row
-                sid = f'sid_{int(time.time()*1000)}'
-                token = make_token(user_id, username, sid)
-                c.execute('INSERT INTO sessions (token, sid, user_id, created_at, last_used) VALUES (?, ?, ?, ?, ?)',
-                          (token, sid, user_id, int(time.time()), int(time.time())))
-                conn.commit()
-                conn.close()
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    try:
+                        bound_user, challenge, origin, rp_id = consume_challenge(
+                            conn, data.get('challengeToken'), 'authenticate')
+                        row = conn.execute('''SELECT u.id, u.username, p.id, p.public_key, p.sign_count
+                            FROM users u JOIN passkeys p ON u.id = p.user_id
+                            WHERE p.credential_id = ? AND p.public_key IS NOT NULL''', (cred.get('id'),)).fetchone()
+                        if not row or (bound_user is not None and row[0] != bound_user):
+                            raise ValueError('Unknown credential')
+                        user_id, username, pk_id, public_key, sign_count = row
+                        verified = verify_authentication_response(
+                            credential=cred, expected_challenge=base64url_to_bytes(challenge),
+                            expected_rp_id=rp_id, expected_origin=origin,
+                            credential_public_key=base64url_to_bytes(public_key),
+                            credential_current_sign_count=sign_count)
+                    except Exception:
+                        conn.commit()
+                        return self.send_error_json(401, 'INVALID_CREDENTIALS', 'Passkey verification failed')
+                    conn.execute('UPDATE passkeys SET sign_count = ? WHERE id = ?', (verified.new_sign_count, pk_id))
+                    token = create_session(conn, user_id, username)
                 return self.send_json({'token': token, 'user': {'id': user_id, 'username': username}})
 
             # 1. 注册: POST /api/register
@@ -332,12 +451,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                         'INSERT INTO users (id, username, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)',
                         (user_id, username, pw_hash, salt, int(time.time()))
                     )
-                    sid = f"sid_{int(time.time()*1000)}"
-                    token = make_token(user_id, username, sid)
-                    c.execute(
-                        'INSERT INTO sessions (token, sid, user_id, created_at, last_used) VALUES (?, ?, ?, ?, ?)',
-                        (token, sid, user_id, int(time.time()), int(time.time()))
-                    )
+                    token = create_session(conn, user_id, username)
                     conn.commit()
                     conn.close()
                     return self.send_json({"token": token, "user": {"id": user_id, "username": username}})
@@ -354,6 +468,8 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
 
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
+                # Serialize credential validation with password changes and factor replacement.
+                c.execute('BEGIN IMMEDIATE')
                 c.execute('SELECT id, password_hash, salt, username, totp_secret, backup_codes FROM users WHERE username = ? COLLATE NOCASE', (username,))
                 row = c.fetchone()
                 if not row:
@@ -384,17 +500,11 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                         if clean_code in codes:
                             codes.remove(clean_code)
                             c.execute('UPDATE users SET backup_codes = ? WHERE id = ?', (json.dumps(codes), user_id))
-                            conn.commit()
                         else:
                             conn.close()
                             return self.send_error_json(401, 'TWO_FACTOR_INVALID', '备用恢复码无效')
 
-                sid = f"sid_{int(time.time()*1000)}"
-                token = make_token(user_id, real_username, sid)
-                c.execute(
-                    'INSERT INTO sessions (token, sid, user_id, created_at, last_used) VALUES (?, ?, ?, ?, ?)',
-                    (token, sid, user_id, int(time.time()), int(time.time()))
-                )
+                token = create_session(conn, user_id, real_username)
                 conn.commit()
                 conn.close()
                 return self.send_json({"token": token, "user": {"id": user_id, "username": real_username}})
@@ -412,17 +522,22 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
 
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
+                c.execute('BEGIN IMMEDIATE')
                 c.execute('SELECT password_hash, salt FROM users WHERE id = ?', (auth_user['user_id'],))
                 row = c.fetchone()
                 if not row or hash_password(old_pw, row[1]) != row[0]:
                     conn.close()
                     return self.send_error_json(401, 'WRONG_PASSWORD', '当前密码不正确')
 
-                new_salt = hashlib.md5(f"{time.time()}_{new_pw}".encode()).hexdigest()[:8]
+                if not isinstance(new_pw, str) or not 8 <= len(new_pw) <= 128:
+                    conn.close()
+                    return self.send_error_json(400, 'INVALID_REQUEST', 'Password must be 8-128 characters')
+                new_salt = secrets.token_hex(16)
                 c.execute(
                     'UPDATE users SET password_hash = ?, salt = ? WHERE id = ?',
                     (hash_password(new_pw, new_salt), new_salt, auth_user['user_id'])
                 )
+                c.execute('DELETE FROM sessions WHERE user_id = ? AND sid != ?', (auth_user['user_id'], auth_user['sid']))
                 conn.commit()
                 conn.close()
                 return self.send_json({"success": True})
@@ -436,44 +551,34 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 secret = data.get('secret') or ''
                 code = data.get('code') or ''
 
-                if not verify_totp(secret, code):
-                    return self.send_error_json(400, 'INVALID_CODE', '验证码不匹配，请核对手机时间与输入')
-
-                codes = generate_backup_codes()
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute(
-                    'UPDATE users SET totp_secret = ?, backup_codes = ? WHERE id = ?',
-                    (secret, json.dumps(codes), auth_user['user_id'])
-                )
-                conn.commit()
-                conn.close()
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if not self.require_password(conn, auth_user['user_id'], data, require_totp=True, code_field='currentCode'):
+                        return
+                    if not re.fullmatch(r'[A-Z2-7]{16,64}', secret, re.IGNORECASE) or not verify_totp(secret, code):
+                        return self.send_error_json(400, 'INVALID_CODE', '验证码不匹配，请核对手机时间与输入')
+                    codes = generate_backup_codes()
+                    conn.execute('UPDATE users SET totp_secret = ?, backup_codes = ? WHERE id = ?',
+                                 (secret, json.dumps(codes), auth_user['user_id']))
                 return self.send_json({"backupCodes": codes})
 
             # 5. 关闭 2FA: POST /api/user/2fa
             if path == '/api/user/2fa':
-                auth_user = self.get_token_user()
-                if not auth_user:
-                    return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('UPDATE users SET totp_secret = NULL, backup_codes = NULL WHERE id = ?', (auth_user['user_id'],))
-                conn.commit()
-                conn.close()
-                return self.send_json({"success": True})
+                return self.disable_totp()
 
             # 6. 生成新备用码: POST /api/user/2fa/backup-codes/generate
             if path == '/api/user/2fa/backup-codes/generate':
                 auth_user = self.get_token_user()
                 if not auth_user:
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
-                codes = generate_backup_codes()
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('UPDATE users SET backup_codes = ? WHERE id = ?', (json.dumps(codes), auth_user['user_id']))
-                conn.commit()
-                conn.close()
-                return self.send_json({"backupCodes": codes})
+                data = self.read_json_body()
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if not self.require_password(conn, auth_user['user_id'], data, require_totp=True):
+                        return
+                    codes = generate_backup_codes()
+                    conn.execute('UPDATE users SET backup_codes = ? WHERE id = ?', (json.dumps(codes), auth_user['user_id']))
+                return self.send_json({"codes": codes, "backupCodes": codes})
 
             # 7. 上传云端备份: POST /api/content
             if path == '/api/content':
@@ -527,7 +632,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 c = conn.cursor()
                 c.execute('SELECT totp_secret FROM users WHERE id = ?', (auth_user['user_id'],))
                 row = c.fetchone()
-                c.execute('SELECT COUNT(*) FROM passkeys WHERE user_id = ?', (auth_user['user_id'],))
+                c.execute('SELECT COUNT(*) FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL', (auth_user['user_id'],))
                 pk_cnt = c.fetchone()[0]
                 conn.close()
                 has_totp = bool(row and row[0])
@@ -562,15 +667,18 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 auth_user = self.get_token_user()
                 if not auth_user:
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
+                now = int(time.time())
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    rows = conn.execute('''SELECT sid, created_at, last_used FROM sessions
+                        WHERE user_id = ? AND auth_version = 1 AND created_at > ? AND last_used > ?
+                        ORDER BY created_at DESC''',
+                                        (auth_user['user_id'], now - SESSION_MAX_AGE, now - SESSION_IDLE_TIMEOUT)).fetchall()
                 return self.send_json([{
-                    "id": auth_user.get('sid', 'curr'),
-                    "user_id": auth_user['user_id'],
-                    "created_at": int(time.time()),
-                    "last_used_at": int(time.time()),
-                    "device_info": "本地多设备共享服务器",
-                    "ip": self.client_address[0],
-                    "is_current": True
-                }])
+                    'id': row[0], 'user_id': auth_user['user_id'],
+                    'created_at': row[1], 'last_used_at': row[2],
+                    'device_info': '本地多设备共享服务器', 'ip': '',
+                    'is_current': row[0] == auth_user['sid']
+                } for row in rows])
 
             # 通行密钥列表: GET /api/user/passkeys
             if path == '/api/user/passkeys':
@@ -579,7 +687,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
-                c.execute('SELECT id, credential_id, device_name, created_at FROM passkeys WHERE user_id = ? ORDER BY created_at DESC', (auth_user['user_id'],))
+                c.execute('SELECT id, credential_id, device_name, created_at FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL ORDER BY created_at DESC', (auth_user['user_id'],))
                 rows = c.fetchall()
                 conn.close()
                 res = [{'id': r[0], 'credential_id': r[1], 'device_name': r[2], 'created_at': r[3]} for r in rows]
@@ -588,37 +696,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
             # 通行密钥免密登录选项: GET /api/auth/passkey-options
             if path == '/api/auth/passkey-options':
                 query = urllib.parse.parse_qs(url.query)
-                username = (query.get('username', [''])[0]).strip()
-                origin = self.headers.get('Origin', '') or f'http://{self.headers.get("Host", "localhost")}'
-                try:
-                    rp_id = urllib.parse.urlparse(origin).hostname or 'localhost'
-                except Exception:
-                    rp_id = 'localhost'
-                challenge = b64url_encode(os.urandom(32))
-
-                credential_ids = []
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                if username:
-                    c.execute('SELECT id FROM users WHERE username = ? COLLATE NOCASE', (username,))
-                    urow = c.fetchone()
-                    if urow:
-                        c.execute('SELECT credential_id FROM passkeys WHERE user_id = ?', (urow[0],))
-                        credential_ids = [r[0] for r in c.fetchall()]
-                else:
-                    c.execute('SELECT credential_id FROM passkeys')
-                    credential_ids = [r[0] for r in c.fetchall()]
-                conn.close()
-
-                challenge_token = make_token("auth", username or "any", f"challenge_{challenge}")
-                return self.send_json({
-                    'challengeToken': challenge_token,
-                    'challenge': challenge,
-                    'credentialIds': credential_ids,
-                    'rpId': rp_id,
-                    'timeout': 60000,
-                    'userVerification': 'preferred'
-                })
+                return self.passkey_auth_options((query.get('username', [''])[0]).strip())
 
             # 7. 云端备份列表: GET /api/content
             if path == '/api/content':
@@ -720,24 +798,17 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 if not auth_user:
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
                 pk_id = urllib.parse.unquote(path.split('/')[-1])
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('DELETE FROM passkeys WHERE id = ? AND user_id = ?', (pk_id, auth_user['user_id']))
-                conn.commit()
-                conn.close()
+                data = self.read_json_body()
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if not self.require_password(conn, auth_user['user_id'], data, require_totp=True):
+                        return
+                    conn.execute('DELETE FROM passkeys WHERE id = ? AND user_id = ?', (pk_id, auth_user['user_id']))
                 return self.send_json({'message': 'Passkey deleted'})
 
             # 关闭 2FA: DELETE /api/user/2fa
             if path == '/api/user/2fa':
-                auth_user = self.get_token_user()
-                if not auth_user:
-                    return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('UPDATE users SET totp_secret = NULL, backup_codes = NULL WHERE id = ?', (auth_user['user_id'],))
-                conn.commit()
-                conn.close()
-                return self.send_json({'success': True})
+                return self.disable_totp()
 
             # 删除单个备份: DELETE /api/content/<id>
             if path.startswith('/api/content/'):
@@ -753,7 +824,18 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 return self.send_json({"success": True})
 
             # 注销会话: DELETE /api/user/sessions/:id
-            if path.startswith('/api/user/sessions'):
+            if path == '/api/user/sessions' or re.fullmatch(r'/api/user/sessions/[^/]+', path):
+                auth_user = self.get_token_user()
+                if not auth_user:
+                    return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    if path == '/api/user/sessions':
+                        conn.execute('DELETE FROM sessions WHERE user_id = ? AND sid != ?',
+                                     (auth_user['user_id'], auth_user['sid']))
+                    else:
+                        sid = urllib.parse.unquote(path.split('/')[-1])
+                        conn.execute('DELETE FROM sessions WHERE user_id = ? AND sid = ?',
+                                     (auth_user['user_id'], sid))
                 return self.send_json({"success": True})
 
             return self.send_error_json(404, 'NOT_FOUND', 'Not Found')

@@ -2,6 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
 # 复制已包含的完整编译产物与服务器
 COPY dist ./dist
 COPY server.py ./server.py

@@ -5,28 +5,34 @@ import { useEscape } from '../hooks/useEscape';
 interface PasswordInputModalProps {
     isOpen: boolean;
     onClose: () => void;
-    onConfirm: (pw: string) => void;
+    onConfirm: (pw: string, code?: string) => void;
     title?: string;
     description?: string;
     error?: string | null;
     loading?: boolean;
     /** Mask the input as a password field (defaults to the legacy visible text). */
     masked?: boolean;
+    requireCode?: boolean;
 }
 
-const PasswordInputModal = ({ isOpen, onClose, onConfirm, title, description, error, loading, masked }: PasswordInputModalProps) => {
+const PasswordInputModal = ({ isOpen, onClose, onConfirm, title, description, error, loading, masked, requireCode = false }: PasswordInputModalProps) => {
     const { t } = useTranslation();
     const [password, setPassword] = useState("");
+    const [code, setCode] = useState("");
 
     useEscape(onClose, isOpen);
 
     useEffect(() => {
-        if (isOpen) setPassword("");
+        if (isOpen) {
+            setPassword("");
+            setCode("");
+        }
     }, [isOpen]);
 
     if (!isOpen) return null;
 
-    const submit = () => { if (password && !loading) onConfirm(password); };
+    const canSubmit = !!password && !loading && (!requireCode || code.length === 6);
+    const submit = () => { if (canSubmit) onConfirm(password, requireCode ? code : undefined); };
 
     return (
         <div className="modal-overlay z-[60] p-4">
@@ -47,6 +53,24 @@ const PasswordInputModal = ({ isOpen, onClose, onConfirm, title, description, er
                         autoFocus
                     />
 
+                    {requireCode && (
+                        <label className="block text-xs text-muted mb-2">
+                            {t('account.2fa_code')}
+                            <input
+                                type="text"
+                                inputMode="numeric"
+                                pattern="[0-9]{6}"
+                                maxLength={6}
+                                value={code}
+                                onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                                onKeyDown={e => { if (e.key === 'Enter') submit(); }}
+                                className="input-base font-mono text-center mt-1"
+                                style={{ fontSize: '16px' }}
+                                autoComplete="one-time-code"
+                            />
+                        </label>
+                    )}
+
                     {error && (
                         <p className="text-xs text-[var(--danger)] mb-2 text-center">{error}</p>
                     )}
@@ -55,7 +79,7 @@ const PasswordInputModal = ({ isOpen, onClose, onConfirm, title, description, er
                         <button onClick={onClose} className="btn-secondary flex-1">{t('btn.cancel')}</button>
                         <button
                             onClick={submit}
-                            disabled={!password || loading}
+                            disabled={!canSubmit}
                             className="btn-primary flex-1"
                         >
                             {t('btn.ok')}

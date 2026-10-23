@@ -36,3 +36,7 @@ data/
 # Test Data
 test_data_*.json
 /media
+
+# Python
+.venv/
+__pycache__/
