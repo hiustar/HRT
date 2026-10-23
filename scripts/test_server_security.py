@@ -4,7 +4,7 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import hmac
 import http.client
@@ -117,9 +117,12 @@ class ServerSecurityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="hrt-security-")
         cls.old_env = {name: os.environ.get(name)
-                       for name in ("PERSIST_DIR", "PUBLIC_APP_ORIGIN")}
+                       for name in ("PERSIST_DIR", "PUBLIC_APP_ORIGIN",
+                                    "WEBAUTHN_ALLOWED_ORIGINS", "WEBAUTHN_RP_ID")}
         os.environ["PERSIST_DIR"] = cls.temp.name
         os.environ["PUBLIC_APP_ORIGIN"] = ORIGIN
+        os.environ.pop("WEBAUTHN_ALLOWED_ORIGINS", None)
+        os.environ.pop("WEBAUTHN_RP_ID", None)
         try:
             spec = importlib.util.spec_from_file_location(
                 "hrt_security_test_backend", ROOT / "server.py")
@@ -165,8 +168,11 @@ class ServerSecurityTests(unittest.TestCase):
         self.token = result["token"]
         self.user_id = result["user"]["id"]
 
-    def request(self, method, path, data=None, token=None, origin=ORIGIN):
-        headers = {"Origin": origin, "Accept": "application/json"}
+    def request(self, method, path, data=None, token=None, origin=ORIGIN, headers=None):
+        headers = dict(headers or {})
+        headers["Accept"] = "application/json"
+        if origin is not None:
+            headers["Origin"] = origin
         if token:
             headers["Authorization"] = "Bearer " + token
         body = None
@@ -228,30 +234,91 @@ class ServerSecurityTests(unittest.TestCase):
         if not CRYPTO_AVAILABLE:
             self.skipTest("requires real webauthn, cryptography and cbor2 dependencies")
 
-    def register_options(self):
-        return self.ok("POST", "/api/user/passkey/register-options", {}, self.token)
+    def register_options(self, origin=ORIGIN, **kwargs):
+        return self.ok("POST", "/api/user/passkey/register-options", {}, self.token,
+                       origin=origin, **kwargs)
 
-    def enroll(self, proof=None):
+    def enroll(self, proof=None, origin=ORIGIN, rp_id=RP_ID):
         self.crypto()
         authenticator = Authenticator()
-        options = self.register_options()
-        data = {"password": PASSWORD, "credential": authenticator.registration(options),
+        options = self.register_options(origin=origin)
+        data = {"password": PASSWORD,
+                "credential": authenticator.registration(options, origin=origin, rp_id=rp_id),
                 "challengeToken": options["challengeToken"], "deviceName": "Security test ES256"}
         if proof:
             data.update(proof)
-        result = self.ok("POST", "/api/user/passkey/register", data, self.token)
+        result = self.ok("POST", "/api/user/passkey/register", data, self.token, origin=origin)
         row = self.sql("SELECT id FROM passkeys WHERE credential_id = ?",
                        (b64(authenticator.credential_id),))
         self.assertEqual(len(row), 1, result)
         return authenticator, row[0][0]
 
-    def auth_options(self, username=None):
+    def auth_options(self, username=None, origin=ORIGIN, **kwargs):
         return self.ok("POST", "/api/auth/passkey-options",
-                       {} if username is None else {"username": username})
+                       {} if username is None else {"username": username}, origin=origin, **kwargs)
 
     def verify(self, authenticator, options, **kwargs):
         return {"challengeToken": options["challengeToken"],
                 "credential": authenticator.assertion(options, **kwargs)}
+
+    @contextmanager
+    def webauthn_environment(self, **values):
+        names = ("PUBLIC_APP_ORIGIN", "WEBAUTHN_ALLOWED_ORIGINS", "WEBAUTHN_RP_ID")
+        previous = {name: os.environ.get(name) for name in names}
+        try:
+            for name in names:
+                value = values.get(name)
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            yield
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    @contextmanager
+    def webauthn_config(self, origins, rp_id):
+        # Requests finish synchronously before restoring these process-wide globals.
+        with patch.multiple(self.backend, ALLOWED_ORIGINS=tuple(origins), RP_ID=rp_id):
+            yield
+
+    @contextmanager
+    def migration_database(self, challenge_rps=(), public_origin=None, existing_rp=False):
+        """Copy a valid signed-session DB, then reproduce only the pre-RP schema."""
+        secret = self.stored_secret()
+        authenticator, pk_id = self.enroll({"code": totp(secret)} if secret else None)
+        with tempfile.TemporaryDirectory(prefix="hrt-rp-migration-") as directory:
+            path = os.path.join(directory, "migration.db")
+            with closing(sqlite3.connect(self.backend.DB_PATH)) as source:
+                with closing(sqlite3.connect(path)) as target:
+                    source.backup(target)
+            with closing(sqlite3.connect(path)) as db, db:
+                if not existing_rp:
+                    rows = db.execute("SELECT id, user_id, credential_id, device_name, created_at, "
+                                      "public_key, sign_count FROM passkeys").fetchall()
+                    db.execute("DROP TABLE passkeys")
+                    db.execute("CREATE TABLE passkeys (id TEXT PRIMARY KEY, user_id TEXT, "
+                               "credential_id TEXT UNIQUE, device_name TEXT, created_at INTEGER, "
+                               "public_key TEXT, sign_count INTEGER NOT NULL DEFAULT 0)")
+                    db.executemany("INSERT INTO passkeys VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+                db.execute("DELETE FROM webauthn_challenges")
+                for rp_id in challenge_rps:
+                    db.execute("INSERT INTO webauthn_challenges VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (uuid.uuid4().hex, "authenticate", self.user_id, b64(os.urandom(32)),
+                                "https://" + rp_id, rp_id, int(time.time()) + 300))
+            with self.webauthn_environment(PUBLIC_APP_ORIGIN=public_origin):
+                with patch.multiple(self.backend, DB_PATH=path,
+                                    SESSION_SIGNING_KEY=self.backend.SESSION_SIGNING_KEY):
+                    with self.webauthn_config(("https://new.example",), "new.example"):
+                        yield authenticator, pk_id
+        self.alive(self.token)
+
+    def credential_ids(self, options, field="credentialIds"):
+        return set(options.get(field, []))
 
     def test_session_registration_and_login_are_valid(self):
         self.alive(self.token)
@@ -673,6 +740,412 @@ class ServerSecurityTests(unittest.TestCase):
                 self.assertTrue(self.sql("SELECT id FROM passkeys WHERE id = ?", (pk_id,)))
         self.ok("DELETE", path, {"password": PASSWORD, "code": totp(SECRET)}, self.token)
         self.assertFalse(self.sql("SELECT id FROM passkeys WHERE id = ?", (pk_id,)))
+
+    def test_webauthn_config_allowed_origins_override_legacy_and_deduplicate(self):
+        with self.webauthn_environment(
+                PUBLIC_APP_ORIGIN="not a valid legacy origin",
+                WEBAUTHN_ALLOWED_ORIGINS=" https://APP.Example:443,https://app.example,https://app.example:8443 "):
+            origins, rp_id = self.backend.load_webauthn_config()
+        self.assertIsInstance(origins, tuple)
+        self.assertEqual(origins, ("https://app.example", "https://app.example:8443"))
+        self.assertEqual(rp_id, "app.example")
+
+    def test_webauthn_config_legacy_fallback_and_default_first_origin_rp(self):
+        with self.webauthn_environment(PUBLIC_APP_ORIGIN="https://OLD.Example:443"):
+            self.assertEqual(self.backend.load_webauthn_config(), (("https://old.example",), "old.example"))
+        with self.webauthn_environment(
+                WEBAUTHN_ALLOWED_ORIGINS="https://first.example:8443,https://unrelated.example"):
+            self.assertEqual(self.backend.load_webauthn_config(),
+                             (("https://first.example:8443", "https://unrelated.example"), "first.example"))
+
+    def test_webauthn_config_explicit_parent_rp_and_unrelated_legacy_origin(self):
+        with self.webauthn_environment(
+                WEBAUTHN_ALLOWED_ORIGINS="https://old.example,https://app.accounts.example",
+                WEBAUTHN_RP_ID="Accounts.Example"):
+            self.assertEqual(self.backend.load_webauthn_config(),
+                             (("https://old.example", "https://app.accounts.example"), "accounts.example"))
+
+    def test_webauthn_config_rejects_rp_not_matching_any_origin(self):
+        for rp_id in ("evil.example", "example.com", "ample.com"):
+            with self.subTest(rp_id=rp_id), self.webauthn_environment(
+                    WEBAUTHN_ALLOWED_ORIGINS="https://notexample.com,https://example.com.evil.test",
+                    WEBAUTHN_RP_ID=rp_id):
+                with self.assertRaises(ValueError):
+                    self.backend.load_webauthn_config()
+
+    def test_webauthn_config_rejects_non_domain_rp(self):
+        for rp_id in ("https://hrt.example", "hrt.example:443", "hrt.example/path",
+                      "*.hrt.example", "user@hrt.example", "hrt.example?x=1", "-hrt.example"):
+            with self.subTest(rp_id=rp_id), self.webauthn_environment(
+                    WEBAUTHN_ALLOWED_ORIGINS=ORIGIN, WEBAUTHN_RP_ID=rp_id):
+                with self.assertRaises(ValueError):
+                    self.backend.load_webauthn_config()
+
+    def test_webauthn_normalize_origin_canonical_ports_and_localhost(self):
+        for value, expected in (("HTTPS://HRT.Example:443", ORIGIN),
+                                ("https://HRT.Example:8443", "https://hrt.example:8443"),
+                                ("http://LOCALHOST:80", "http://localhost"),
+                                ("http://localhost:3000", "http://localhost:3000")):
+            with self.subTest(value=value):
+                self.assertEqual(self.backend.normalize_origin(value), expected)
+
+    def test_webauthn_normalize_origin_rejects_untrusted_url_components(self):
+        for value in ("", "null", "*", "https://*.hrt.example", "http://hrt.example",
+                      "https://hrt.example/path", "https://hrt.example?x=1",
+                      "https://hrt.example#fragment", "https://user@hrt.example",
+                      "https://user:password@hrt.example", "https://@hrt.example",
+                      "https://hrt.example:invalid", "https://hrt.example:65536",
+                      "https://hrt.example\\evil", "https://hrt.example evil"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.backend.normalize_origin(value)
+
+    def test_webauthn_config_rejects_invalid_member_not_silently_dropping_it(self):
+        for configured in (ORIGIN + ",null", ORIGIN + ",https://*.example",
+                           ORIGIN + ",", ORIGIN + ",http://remote.example"):
+            with self.subTest(configured=configured), self.webauthn_environment(
+                    WEBAUTHN_ALLOWED_ORIGINS=configured, PUBLIC_APP_ORIGIN=ORIGIN):
+                with self.assertRaises(ValueError):
+                    self.backend.load_webauthn_config()
+
+    def test_webauthn_allowed_origins_global_is_tuple(self):
+        self.assertIsInstance(self.backend.ALLOWED_ORIGINS, tuple)
+        self.assertEqual(self.backend.ALLOWED_ORIGINS, (ORIGIN,))
+        self.assertEqual(self.backend.RP_ID, RP_ID)
+
+    def test_webauthn_multiple_origins_share_parent_rp_real_registration_and_login(self):
+        origins = (ORIGIN, "https://app.hrt.example")
+        with self.webauthn_config(origins, RP_ID):
+            for registration_origin in origins:
+                with self.subTest(registration_origin=registration_origin):
+                    authenticator, pk_id = self.enroll(origin=registration_origin)
+                    self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(RP_ID,)])
+                    for origin in origins:
+                        options = self.auth_options(self.username, origin=origin)
+                        self.assertEqual(options["rpId"], RP_ID)
+                        self.assertIn(b64(authenticator.credential_id), self.credential_ids(options))
+                        result = self.ok("POST", "/api/auth/passkey-verify",
+                                         self.verify(authenticator, options, origin=origin), origin=origin)
+                        self.assertEqual(result["user"]["id"], self.user_id)
+                        self.alive(result["token"])
+
+    def test_webauthn_subdomain_rp_with_sibling_origins_real_crypto(self):
+        rp_id = "accounts.hrt.example"
+        origins = ("https://one.accounts.hrt.example", "https://two.accounts.hrt.example:8443")
+        with self.webauthn_config(origins, rp_id):
+            authenticator, pk_id = self.enroll(origin=origins[0], rp_id=rp_id)
+            self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(rp_id,)])
+            options = self.auth_options(self.username, origin=origins[1])
+            result = self.ok("POST", "/api/auth/passkey-verify",
+                             self.verify(authenticator, options, origin=origins[1], rp_id=rp_id), origin=origins[1])
+            self.alive(result["token"])
+
+    def test_webauthn_nondefault_port_is_part_of_trusted_origin(self):
+        for origin in (ORIGIN + ":8443", "https://hrt.example:80"):
+            with self.subTest(origin=origin):
+                self.denied("POST", "/api/user/passkey/register-options", {}, self.token, origin=origin)
+                self.denied("POST", "/api/auth/passkey-options", {}, origin=origin)
+        with self.webauthn_config((ORIGIN + ":8443",), RP_ID):
+            self.denied("POST", "/api/auth/passkey-options", {}, origin=ORIGIN)
+            self.auth_options(origin=ORIGIN + ":8443")
+
+    def test_webauthn_default_port_request_normalizes_to_challenge_origin(self):
+        options = self.register_options(origin="https://HRT.Example:443")
+        self.assertEqual(self.sql("SELECT origin, rp_id FROM webauthn_challenges WHERE token = ?",
+                                  (options["challengeToken"],)), [(ORIGIN, RP_ID)])
+
+    def test_webauthn_missing_and_null_origin_rejected_all_ceremony_routes(self):
+        routes = (("POST", "/api/user/passkey/register-options", self.token),
+                  ("POST", "/api/user/passkey/register", self.token),
+                  ("POST", "/api/auth/passkey-options", None),
+                  ("GET", "/api/auth/passkey-options?username=" + quote(self.username), None),
+                  ("POST", "/api/auth/passkey-verify", None))
+        for origin in (None, "null"):
+            for method, path, token in routes:
+                with self.subTest(origin=origin, path=path):
+                    self.denied(method, path, {} if method == "POST" else None, token, origin=origin)
+
+    def test_webauthn_host_and_forwarded_headers_cannot_supply_trusted_origin(self):
+        forged_headers = {"Host": RP_ID, "X-Forwarded-Host": RP_ID,
+                          "X-Forwarded-Proto": "https", "X-Forwarded-Port": "443",
+                          "Forwarded": "host=hrt.example;proto=https"}
+        for origin in (None, "null", "https://evil.example"):
+            with self.subTest(origin=origin):
+                self.denied("POST", "/api/user/passkey/register-options", {}, self.token,
+                            origin=origin, headers=forged_headers)
+                self.denied("POST", "/api/auth/passkey-options", {}, origin=origin, headers=forged_headers)
+
+    def test_webauthn_untrusted_host_headers_do_not_override_valid_origin_or_rp(self):
+        headers = {"Host": "evil.example:8443", "X-Forwarded-Host": "evil.example",
+                   "X-Forwarded-Proto": "http", "Forwarded": "host=evil.example;proto=http"}
+        options = self.register_options(headers=headers)
+        self.assertEqual(options["rp"]["id"], RP_ID)
+        self.assertEqual(self.sql("SELECT origin, rp_id FROM webauthn_challenges WHERE token = ?",
+                                  (options["challengeToken"],)), [(ORIGIN, RP_ID)])
+        self.assertEqual(self.auth_options(headers=headers)["rpId"], RP_ID)
+
+    def test_webauthn_challenges_capture_each_request_origin_and_current_rp(self):
+        origins = (ORIGIN, "https://app.hrt.example")
+        with self.webauthn_config(origins, RP_ID):
+            for origin in origins:
+                for options in (self.register_options(origin=origin), self.auth_options(origin=origin)):
+                    self.assertEqual(self.sql("SELECT origin, rp_id FROM webauthn_challenges WHERE token = ?",
+                                              (options["challengeToken"],)), [(origin, RP_ID)])
+
+    def test_webauthn_registration_challenge_cannot_move_between_allowed_origins(self):
+        self.crypto()
+        second = "https://app.hrt.example"
+        with self.webauthn_config((ORIGIN, second), RP_ID):
+            for request_origin, client_origin in ((second, ORIGIN), (second, second), (ORIGIN, second)):
+                with self.subTest(request_origin=request_origin, client_origin=client_origin):
+                    authenticator = Authenticator()
+                    options = self.register_options()
+                    data = {"password": PASSWORD, "challengeToken": options["challengeToken"],
+                            "credential": authenticator.registration(options, origin=client_origin)}
+                    self.denied("POST", "/api/user/passkey/register", data, self.token, origin=request_origin)
+                    self.assertFalse(self.sql("SELECT id FROM passkeys WHERE credential_id = ?",
+                                              (b64(authenticator.credential_id),)))
+
+    def test_webauthn_auth_challenge_cannot_move_between_allowed_origins(self):
+        authenticator, _ = self.enroll()
+        second = "https://app.hrt.example"
+        with self.webauthn_config((ORIGIN, second), RP_ID):
+            for request_origin, client_origin in ((second, ORIGIN), (second, second), (ORIGIN, second)):
+                with self.subTest(request_origin=request_origin, client_origin=client_origin):
+                    options = self.auth_options(self.username)
+                    self.denied("POST", "/api/auth/passkey-verify",
+                                self.verify(authenticator, options, origin=client_origin), origin=request_origin)
+
+    def test_webauthn_registration_challenge_rejected_after_rp_change(self):
+        self.crypto()
+        origin = "https://app.hrt.example"
+        for signed_rp in (RP_ID, "app.hrt.example"):
+            with self.subTest(signed_rp=signed_rp):
+                with self.webauthn_config((origin,), RP_ID):
+                    options = self.register_options(origin=origin)
+                authenticator = Authenticator()
+                data = {"password": PASSWORD, "challengeToken": options["challengeToken"],
+                        "credential": authenticator.registration(options, origin=origin, rp_id=signed_rp)}
+                with self.webauthn_config((origin,), "app.hrt.example"):
+                    self.denied("POST", "/api/user/passkey/register", data, self.token, origin=origin)
+                self.assertFalse(self.sql("SELECT id FROM passkeys WHERE credential_id = ?",
+                                          (b64(authenticator.credential_id),)))
+
+    def test_webauthn_auth_challenge_rejected_after_rp_change(self):
+        authenticator, pk_id = self.enroll()
+        origin = "https://app.hrt.example"
+        for key_rp in (RP_ID, "app.hrt.example"):
+            with self.subTest(key_rp=key_rp):
+                with self.webauthn_config((origin,), RP_ID):
+                    options = self.auth_options(self.username, origin=origin)
+                # Also test a key belonging to the new RP: stale challenge alone must fail.
+                self.sql("UPDATE passkeys SET rp_id = ? WHERE id = ?", (key_rp, pk_id))
+                with self.webauthn_config((origin,), "app.hrt.example"):
+                    self.denied("POST", "/api/auth/passkey-verify",
+                                self.verify(authenticator, options, origin=origin, rp_id=key_rp), origin=origin)
+
+    def test_webauthn_challenge_rejected_after_origin_removed_from_config(self):
+        authenticator, _ = self.enroll()
+        options = self.auth_options(self.username)
+        with self.webauthn_config(("https://app.hrt.example",), RP_ID):
+            self.denied("POST", "/api/auth/passkey-verify", self.verify(authenticator, options))
+
+    def test_webauthn_unrelated_allowed_old_origin_rejected_only_for_ceremonies(self):
+        with self.webauthn_config((ORIGIN, "https://new.example"), "new.example"):
+            for method, path, token in (("POST", "/api/user/passkey/register-options", self.token),
+                                        ("POST", "/api/user/passkey/register", self.token),
+                                        ("POST", "/api/auth/passkey-options", None),
+                                        ("GET", "/api/auth/passkey-options", None),
+                                        ("POST", "/api/auth/passkey-verify", None)):
+                with self.subTest(path=path):
+                    self.denied(method, path, {} if method == "POST" else None, token)
+            self.alive(self.login())
+            self.alive(self.token)
+            self.ok("GET", "/api/user/passkeys", token=self.token)
+            self.register_options(origin="https://new.example")
+
+    def test_webauthn_unrelated_origin_never_reports_current_rp_as_usable(self):
+        self.enroll()
+        with self.webauthn_config((ORIGIN, 'https://new.example'), RP_ID):
+            for origin, headers in (('https://new.example', {}),
+                                    (None, {'Referer': 'https://new.example/account'}),
+                                    ('null', {})):
+                with self.subTest(origin=origin, headers=headers):
+                    status = self.ok('GET', '/api/user/2fa/status', token=self.token,
+                                     origin=origin, headers=headers)
+                    self.assertFalse(status['passkey'])
+                    self.assertFalse(status['enabled'])
+                    rows = self.ok('GET', '/api/user/passkeys', token=self.token,
+                                   origin=origin, headers=headers)
+                    self.assertFalse(rows[0]['is_current_rp'])
+
+    def test_webauthn_same_origin_get_uses_referer_for_parent_rp_status(self):
+        self.enroll()
+        with self.webauthn_config((ORIGIN, 'https://app.hrt.example'), RP_ID):
+            headers = {'Referer': 'https://app.hrt.example/account'}
+            status = self.ok('GET', '/api/user/2fa/status', token=self.token,
+                             origin=None, headers=headers)
+            self.assertTrue(status['passkey'])
+            rows = self.ok('GET', '/api/user/passkeys', token=self.token,
+                           origin=None, headers=headers)
+            self.assertTrue(rows[0]['is_current_rp'])
+
+    def test_webauthn_old_rp_key_hidden_from_allow_and_exclude_lists(self):
+        old, _ = self.enroll()
+        new_origin, new_rp = "https://new.example", "new.example"
+        with self.webauthn_config((ORIGIN, new_origin), new_rp):
+            options = self.auth_options(self.username, origin=new_origin)
+            self.assertNotIn(b64(old.credential_id), self.credential_ids(options))
+            self.assertNotIn(b64(old.credential_id), self.credential_ids(
+                self.register_options(origin=new_origin), "excludeCredentialIds"))
+            current, _ = self.enroll(origin=new_origin, rp_id=new_rp)
+            self.assertEqual(self.credential_ids(self.auth_options(self.username, origin=new_origin)),
+                             {b64(current.credential_id)})
+            self.assertEqual(self.credential_ids(self.register_options(origin=new_origin), "excludeCredentialIds"),
+                             {b64(current.credential_id)})
+
+    def test_webauthn_old_rp_key_cannot_authenticate_even_with_valid_current_rp_signature(self):
+        old, _ = self.enroll()
+        new_origin, new_rp = "https://new.example", "new.example"
+        with self.webauthn_config((new_origin,), new_rp):
+            for username in (None, self.username):
+                for signed_rp in (RP_ID, new_rp):
+                    with self.subTest(username=username, signed_rp=signed_rp):
+                        options = self.auth_options(username, origin=new_origin)
+                        self.denied("POST", "/api/auth/passkey-verify",
+                                    self.verify(old, options, origin=new_origin, rp_id=signed_rp), origin=new_origin)
+
+    def test_webauthn_rp_change_status_excludes_old_key_and_enrollment_restores_it(self):
+        self.enroll()
+        with self.webauthn_config(("https://new.example",), "new.example"):
+            status = self.ok("GET", "/api/user/2fa/status", token=self.token, origin="https://new.example")
+            self.assertFalse(status["passkey"])
+            self.assertFalse(status["enabled"])
+            self.enroll(origin="https://new.example", rp_id="new.example")
+            status = self.ok("GET", "/api/user/2fa/status", token=self.token, origin="https://new.example")
+            self.assertTrue(status["passkey"])
+            self.assertTrue(status["enabled"])
+
+    def test_webauthn_migration_password_totp_backup_login_and_new_enrollment(self):
+        self.enroll()
+        self.enable()
+        codes = self.ok("POST", "/api/user/2fa/backup-codes/generate",
+                        {"password": PASSWORD, "code": totp(SECRET)}, self.token)["codes"]
+        new_origin, new_rp = "https://new.example", "new.example"
+        with self.webauthn_config((ORIGIN, new_origin), new_rp):
+            self.denied("POST", "/api/login", {"username": self.username, "password": PASSWORD}, origin=new_origin)
+            for login_origin in (ORIGIN, new_origin):
+                result = self.ok("POST", "/api/login", {"username": self.username,
+                                 "password": PASSWORD, "totp_code": totp(SECRET)}, origin=login_origin)
+                self.alive(result["token"])
+            result = self.ok("POST", "/api/login", {"username": self.username,
+                             "password": PASSWORD, "backup_code": codes[0]}, origin=new_origin)
+            self.alive(result["token"])
+            self.denied("POST", "/api/login", {"username": self.username,
+                        "password": PASSWORD, "backup_code": codes[0]}, origin=new_origin)
+            status = self.ok("GET", "/api/user/2fa/status", token=self.token, origin=new_origin)
+            self.assertTrue(status["totp"])
+            self.assertTrue(status["enabled"])
+            self.assertFalse(status["passkey"])
+            current, _ = self.enroll({"code": totp(SECRET)}, origin=new_origin, rp_id=new_rp)
+            options = self.auth_options(self.username, origin=new_origin)
+            result = self.ok("POST", "/api/auth/passkey-verify",
+                             self.verify(current, options, origin=new_origin, rp_id=new_rp), origin=new_origin)
+            self.alive(result["token"])
+            self.alive(self.token)
+
+    def test_webauthn_passkey_list_retains_old_rp_metadata_and_boolean_current_flag(self):
+        _, old_id = self.enroll()
+        with self.webauthn_config(("https://new.example",), "new.example"):
+            _, current_id = self.enroll(origin="https://new.example", rp_id="new.example")
+            rows = self.ok("GET", "/api/user/passkeys", token=self.token, origin="https://new.example")
+            by_id = {row["id"]: row for row in rows}
+            self.assertEqual(set(by_id), {old_id, current_id})
+            self.assertEqual(by_id[old_id]["rp_id"], RP_ID)
+            self.assertIs(by_id[old_id]["is_current_rp"], False)
+            self.assertEqual(by_id[current_id]["rp_id"], "new.example")
+            self.assertIs(by_id[current_id]["is_current_rp"], True)
+
+    def test_webauthn_old_rp_passkey_remains_manageable_with_password_and_totp(self):
+        _, pk_id = self.enroll()
+        self.enable()
+        with self.webauthn_config(("https://new.example",), "new.example"):
+            path = "/api/user/passkeys/" + quote(pk_id, safe="")
+            self.denied("DELETE", path, {"password": PASSWORD}, self.token, origin="https://new.example")
+            self.ok("DELETE", path, {"password": PASSWORD, "code": totp(SECRET)}, self.token,
+                    origin="https://new.example")
+            self.assertFalse(self.sql("SELECT id FROM passkeys WHERE id = ?", (pk_id,)))
+            self.alive(self.token)
+
+    def test_webauthn_null_rp_public_key_visible_but_never_current_or_usable(self):
+        authenticator, pk_id = self.enroll()
+        self.sql("UPDATE passkeys SET rp_id = NULL WHERE id = ?", (pk_id,))
+        status = self.ok("GET", "/api/user/2fa/status", token=self.token)
+        self.assertFalse(status["passkey"])
+        self.assertFalse(status["enabled"])
+        rows = self.ok("GET", "/api/user/passkeys", token=self.token)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["rp_id"])
+        self.assertIs(rows[0]["is_current_rp"], False)
+        self.assertFalse(self.credential_ids(self.register_options(), "excludeCredentialIds"))
+        options = self.auth_options(self.username)
+        self.assertFalse(self.credential_ids(options))
+        self.denied("POST", "/api/auth/passkey-verify", self.verify(authenticator, options))
+
+    def test_webauthn_schema_migration_prefers_public_origin_over_challenge_rp(self):
+        with self.migration_database(challenge_rps=("challenge.example",),
+                                     public_origin="https://OLD.Example:443") as (_, pk_id):
+            self.backend.init_db()
+            self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [("old.example",)])
+
+    def test_webauthn_schema_migration_does_not_infer_keys_from_temporary_challenges(self):
+        with self.migration_database(challenge_rps=(RP_ID, RP_ID)) as (_, pk_id):
+            self.backend.init_db()
+            self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(None,)])
+
+    def test_webauthn_schema_migration_unknown_rp_stays_null_after_config_change(self):
+        with self.migration_database() as (_, pk_id):
+            self.backend.init_db()
+            self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(None,)])
+            with self.webauthn_environment(PUBLIC_APP_ORIGIN=ORIGIN):
+                self.backend.init_db()
+            self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(None,)])
+
+    def test_webauthn_schema_migration_ambiguous_challenge_rps_remain_null(self):
+        with self.migration_database(challenge_rps=(RP_ID, "other.example")) as (_, pk_id):
+            self.backend.init_db()
+            self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(None,)])
+
+    def test_webauthn_schema_migration_existing_rp_and_null_are_never_rewritten(self):
+        for rp_id in (RP_ID, None):
+            with self.subTest(rp_id=rp_id):
+                with self.migration_database(public_origin="https://new.example", existing_rp=True) as (_, pk_id):
+                    self.sql("UPDATE passkeys SET rp_id = ? WHERE id = ?", (rp_id, pk_id))
+                    self.backend.init_db()
+                    self.backend.init_db()
+                    self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(rp_id,)])
+
+    def test_webauthn_schema_migration_once_preserves_sessions_signkey_and_security_data(self):
+        self.enable()
+        with self.migration_database(public_origin=ORIGIN) as (_, pk_id):
+            key = self.backend.SESSION_SIGNING_KEY
+            queries = ("SELECT * FROM users ORDER BY id", "SELECT * FROM sessions ORDER BY token",
+                       "SELECT * FROM server_settings ORDER BY key", "SELECT * FROM backups ORDER BY id",
+                       "SELECT * FROM webauthn_challenges ORDER BY token",
+                       "SELECT id, user_id, credential_id, device_name, created_at, public_key, sign_count "
+                       "FROM passkeys ORDER BY id")
+            before = [self.sql(query) for query in queries]
+            self.backend.init_db()
+            self.assertEqual(self.backend.SESSION_SIGNING_KEY, key)
+            self.assertEqual([self.sql(query) for query in queries], before)
+            self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(RP_ID,)])
+            with self.webauthn_environment(PUBLIC_APP_ORIGIN="https://new.example"):
+                self.backend.init_db()
+            self.assertEqual(self.backend.SESSION_SIGNING_KEY, key)
+            self.assertEqual([self.sql(query) for query in queries], before)
+            self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(RP_ID,)])
+            self.alive(self.token)
+            self.assertEqual(self.stored_secret(), SECRET)
+            self.alive(self.login(totp_code=totp(SECRET)))
 
 
 if __name__ == "__main__":

@@ -376,7 +376,7 @@ const Account: React.FC<AccountProps> = ({
             const opts = await authService.passkeyAuthOptions(username || undefined);
             const credential = await navigator.credentials.get({
                 publicKey: {
-                    rpId: window.location.hostname,
+                    rpId: opts.rpId ?? window.location.hostname,
                     challenge: b64url2ab(opts.challenge),
                     allowCredentials: opts.credentialIds.map(id => ({
                         type: 'public-key' as const,

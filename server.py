@@ -26,14 +26,46 @@ DB_PATH = os.path.join(PERSIST_DIR, "hrt_server.db")
 SESSION_MAX_AGE = 7 * 86400
 SESSION_IDLE_TIMEOUT = 3 * 86400
 CHALLENGE_MAX_AGE = 300
-PUBLIC_APP_ORIGIN = os.environ.get("PUBLIC_APP_ORIGIN", f"http://localhost:{PORT}").rstrip('/')
-_app_url = urllib.parse.urlsplit(PUBLIC_APP_ORIGIN)
-if (_app_url.scheme not in ('http', 'https') or not _app_url.hostname
-        or _app_url.username or _app_url.password or _app_url.path
-        or _app_url.query or _app_url.fragment
-        or (_app_url.scheme == 'http' and _app_url.hostname not in ('localhost', '127.0.0.1', '::1'))):
-    raise ValueError('PUBLIC_APP_ORIGIN must be an HTTPS origin (HTTP is only allowed for localhost)')
-RP_ID = _app_url.hostname
+
+
+def normalize_origin(value):
+    value = value.strip().rstrip('/')
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment
+            or any(c.isspace() for c in value) or '*' in value or '\\' in value
+            or (parsed.scheme == 'http' and parsed.hostname not in ('localhost', '127.0.0.1', '::1'))):
+        raise ValueError('WebAuthn origins must be HTTPS origins (HTTP is only allowed for localhost)')
+    host = parsed.hostname.encode('idna').decode('ascii').lower()
+    authority = f'[{host}]' if ':' in host else host
+    port = parsed.port
+    if port is not None and port != (443 if parsed.scheme == 'https' else 80):
+        authority += f':{port}'
+    return f'{parsed.scheme}://{authority}'
+
+
+def load_webauthn_config():
+    legacy_origin = os.environ.get('PUBLIC_APP_ORIGIN', '').strip()
+    configured = os.environ.get('WEBAUTHN_ALLOWED_ORIGINS', '').strip()
+    origins = tuple(dict.fromkeys(normalize_origin(value) for value in
+                                 (configured or legacy_origin or f'http://localhost:{PORT}').split(',')))
+    rp_id = os.environ.get('WEBAUTHN_RP_ID', '').strip().lower()
+    rp_id = rp_id or urllib.parse.urlsplit(origins[0]).hostname
+    rp_id = rp_id.encode('idna').decode('ascii')
+    if (not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', rp_id)
+            or len(rp_id) > 253 or ('.' not in rp_id and rp_id != 'localhost')):
+        raise ValueError('WEBAUTHN_RP_ID must be a domain without a scheme, port or path')
+    if not any(origin_supports_rp(origin, rp_id) for origin in origins):
+        raise ValueError('WEBAUTHN_RP_ID must match an allowed origin host or its parent domain')
+    return origins, rp_id
+
+
+def origin_supports_rp(origin, rp_id):
+    host = urllib.parse.urlsplit(origin).hostname
+    return host == rp_id or host.endswith('.' + rp_id)
+
+
+ALLOWED_ORIGINS, RP_ID = load_webauthn_config()
 
 # --- 数据库初始化与自动结构热升级 ---
 def init_db():
@@ -112,6 +144,13 @@ def init_db():
         # Sessions issued before verified passkey authentication cannot be trusted.
         c.execute('DELETE FROM sessions')
     c.execute('CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    if 'rp_id' not in passkey_cols:
+        c.execute('ALTER TABLE passkeys ADD COLUMN rp_id TEXT')
+        legacy_origin = os.environ.get('PUBLIC_APP_ORIGIN', '').strip()
+        previous_rp = urllib.parse.urlsplit(normalize_origin(legacy_origin)).hostname if legacy_origin else None
+        # Old public keys have no RP metadata; never relabel an unknown key as belonging to a new domain.
+        if previous_rp:
+            c.execute('UPDATE passkeys SET rp_id = ? WHERE public_key IS NOT NULL', (previous_rp,))
     c.execute('INSERT OR IGNORE INTO server_settings (key, value) VALUES (?, ?)',
               ('session_signing_key', secrets.token_hex(32)))
     global SESSION_SIGNING_KEY
@@ -179,20 +218,20 @@ def verify_token(token: str):
         return None
 
 
-def create_challenge(conn, purpose, user_id=None):
+def create_challenge(conn, purpose, origin, user_id=None):
     token = secrets.token_urlsafe(32)
     challenge = b64url_encode(os.urandom(32))
     now = int(time.time())
     conn.execute('DELETE FROM webauthn_challenges WHERE expires_at <= ?', (now,))
     conn.execute('INSERT INTO webauthn_challenges VALUES (?, ?, ?, ?, ?, ?, ?)',
-                 (token, purpose, user_id, challenge, PUBLIC_APP_ORIGIN, RP_ID, now + CHALLENGE_MAX_AGE))
+                 (token, purpose, user_id, challenge, origin, RP_ID, now + CHALLENGE_MAX_AGE))
     return token, challenge
 
 
-def consume_challenge(conn, token, purpose, user_id=None):
+def consume_challenge(conn, token, purpose, origin, user_id=None):
     row = conn.execute('''SELECT user_id, challenge, origin, rp_id FROM webauthn_challenges
-        WHERE token = ? AND purpose = ? AND expires_at > ?''',
-                       (token, purpose, int(time.time()))).fetchone()
+        WHERE token = ? AND purpose = ? AND expires_at > ? AND origin = ? AND rp_id = ?''',
+                       (token, purpose, int(time.time()), origin, RP_ID)).fetchone()
     if not row or (purpose == 'register' and row[0] != user_id):
         raise ValueError('Invalid or expired challenge')
     conn.execute('DELETE FROM webauthn_challenges WHERE token = ?', (token,))
@@ -276,11 +315,33 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
         return {}
 
     def check_webauthn_origin(self):
+        try:
+            origin = normalize_origin(self.headers.get('Origin', ''))
+        except ValueError:
+            origin = None
+        if origin not in ALLOWED_ORIGINS:
+            self.send_error_json(400, 'INVALID_REQUEST',
+                                 'Untrusted origin: configure WEBAUTHN_ALLOWED_ORIGINS with the browser origin')
+            return None
+        if not origin_supports_rp(origin, RP_ID):
+            self.send_error_json(400, 'INVALID_REQUEST',
+                                 'This origin cannot use WEBAUTHN_RP_ID; sign in with your password and register a passkey on the new domain')
+            return None
+        return origin
+
+    def current_rp_available(self):
         origin = self.headers.get('Origin')
-        if origin and origin != PUBLIC_APP_ORIGIN:
-            self.send_error_json(400, 'INVALID_REQUEST', 'Untrusted origin')
+        if origin is None:
+            referer = self.headers.get('Referer')
+            if not referer:
+                return True
+            parsed = urllib.parse.urlsplit(referer)
+            origin = f'{parsed.scheme}://{parsed.netloc}'
+        try:
+            origin = normalize_origin(origin)
+        except ValueError:
             return False
-        return True
+        return origin in ALLOWED_ORIGINS and origin_supports_rp(origin, RP_ID)
 
     def require_password(self, conn, user_id, data, require_totp=False, code_field='code'):
         row = conn.execute('SELECT password_hash, salt, totp_secret FROM users WHERE id = ?', (user_id,)).fetchone()
@@ -307,7 +368,8 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
         return self.send_json({'success': True})
 
     def passkey_auth_options(self, username):
-        if not self.check_webauthn_origin():
+        origin = self.check_webauthn_origin()
+        if not origin:
             return
         with closing(sqlite3.connect(DB_PATH)) as conn, conn:
             user_id = None
@@ -317,8 +379,8 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 # A supplied but unknown account must not become an unrestricted challenge.
                 user_id = row[0] if row else secrets.token_urlsafe(32)
                 credential_ids = [r[0] for r in conn.execute(
-                    'SELECT credential_id FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL', (user_id,))]
-            token, challenge = create_challenge(conn, 'authenticate', user_id)
+                    'SELECT credential_id FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL AND rp_id = ?', (user_id, RP_ID))]
+            token, challenge = create_challenge(conn, 'authenticate', origin, user_id)
         return self.send_json({'challengeToken': token, 'challenge': challenge,
                                'credentialIds': credential_ids, 'rpId': RP_ID,
                                'timeout': 60000, 'userVerification': 'preferred'})
@@ -343,14 +405,15 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 auth_user = self.get_token_user()
                 if not auth_user:
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
-                if not self.check_webauthn_origin():
+                origin = self.check_webauthn_origin()
+                if not origin:
                     return
                 user_id_encoded = b64url_encode(auth_user['user_id'].encode('utf-8'))
                 with closing(sqlite3.connect(DB_PATH)) as conn, conn:
                     enrolled = [r[0] for r in conn.execute(
-                        'SELECT credential_id FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL',
-                        (auth_user['user_id'],))]
-                    challenge_token, challenge = create_challenge(conn, 'register', auth_user['user_id'])
+                        'SELECT credential_id FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL AND rp_id = ?',
+                        (auth_user['user_id'], RP_ID))]
+                    challenge_token, challenge = create_challenge(conn, 'register', origin, auth_user['user_id'])
                 return self.send_json({
                     'challengeToken': challenge_token,
                     'challenge': challenge,
@@ -368,7 +431,8 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 auth_user = self.get_token_user()
                 if not auth_user:
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
-                if not self.check_webauthn_origin():
+                origin = self.check_webauthn_origin()
+                if not origin:
                     return
                 data = self.read_json_body()
                 with closing(sqlite3.connect(DB_PATH)) as conn, conn:
@@ -377,7 +441,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                         return
                     try:
                         _, challenge, origin, rp_id = consume_challenge(
-                            conn, data.get('challengeToken'), 'register', auth_user['user_id'])
+                            conn, data.get('challengeToken'), 'register', origin, auth_user['user_id'])
                         verified = verify_registration_response(
                             credential=data.get('credential') or {},
                             expected_challenge=base64url_to_bytes(challenge),
@@ -388,11 +452,11 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                     pk_id = secrets.token_urlsafe(24)
                     try:
                         conn.execute('''INSERT INTO passkeys
-                            (id, user_id, credential_id, device_name, created_at, public_key, sign_count)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                            (id, user_id, credential_id, device_name, created_at, public_key, sign_count, rp_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                                      (pk_id, auth_user['user_id'], b64url_encode(verified.credential_id),
                                       data.get('deviceName') or '通行密钥硬件', int(time.time()),
-                                      b64url_encode(verified.credential_public_key), verified.sign_count))
+                                      b64url_encode(verified.credential_public_key), verified.sign_count, rp_id))
                     except sqlite3.IntegrityError:
                         conn.commit()
                         return self.send_error_json(409, 'CONFLICT', 'Credential already registered')
@@ -405,7 +469,8 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
 
             # 通行密钥免密登录验证: POST /api/auth/passkey-verify
             if path == '/api/auth/passkey-verify':
-                if not self.check_webauthn_origin():
+                origin = self.check_webauthn_origin()
+                if not origin:
                     return
                 data = self.read_json_body()
                 cred = data.get('credential') or {}
@@ -413,10 +478,10 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                     conn.execute('BEGIN IMMEDIATE')
                     try:
                         bound_user, challenge, origin, rp_id = consume_challenge(
-                            conn, data.get('challengeToken'), 'authenticate')
+                            conn, data.get('challengeToken'), 'authenticate', origin)
                         row = conn.execute('''SELECT u.id, u.username, p.id, p.public_key, p.sign_count
                             FROM users u JOIN passkeys p ON u.id = p.user_id
-                            WHERE p.credential_id = ? AND p.public_key IS NOT NULL''', (cred.get('id'),)).fetchone()
+                            WHERE p.credential_id = ? AND p.public_key IS NOT NULL AND p.rp_id = ?''', (cred.get('id'), rp_id)).fetchone()
                         if not row or (bound_user is not None and row[0] != bound_user):
                             raise ValueError('Unknown credential')
                         user_id, username, pk_id, public_key, sign_count = row
@@ -632,11 +697,11 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 c = conn.cursor()
                 c.execute('SELECT totp_secret FROM users WHERE id = ?', (auth_user['user_id'],))
                 row = c.fetchone()
-                c.execute('SELECT COUNT(*) FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL', (auth_user['user_id'],))
+                c.execute('SELECT COUNT(*) FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL AND rp_id = ?', (auth_user['user_id'], RP_ID))
                 pk_cnt = c.fetchone()[0]
                 conn.close()
                 has_totp = bool(row and row[0])
-                has_passkey = bool(pk_cnt > 0)
+                has_passkey = pk_cnt > 0 and self.current_rp_available()
                 return self.send_json({"enabled": has_totp or has_passkey, "totp": has_totp, "passkey": has_passkey})
 
             # 3. 2FA 设置密钥申请: GET /api/user/2fa/setup
@@ -687,10 +752,12 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                     return self.send_error_json(401, 'UNAUTHORIZED', '未登录')
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
-                c.execute('SELECT id, credential_id, device_name, created_at FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL ORDER BY created_at DESC', (auth_user['user_id'],))
+                c.execute('SELECT id, credential_id, device_name, created_at, rp_id FROM passkeys WHERE user_id = ? AND public_key IS NOT NULL ORDER BY created_at DESC', (auth_user['user_id'],))
                 rows = c.fetchall()
                 conn.close()
-                res = [{'id': r[0], 'credential_id': r[1], 'device_name': r[2], 'created_at': r[3]} for r in rows]
+                available = self.current_rp_available()
+                res = [{'id': r[0], 'credential_id': r[1], 'device_name': r[2], 'created_at': r[3],
+                        'rp_id': r[4], 'is_current_rp': r[4] == RP_ID and available} for r in rows]
                 return self.send_json(res)
 
             # 通行密钥免密登录选项: GET /api/auth/passkey-options

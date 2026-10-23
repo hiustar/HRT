@@ -38,6 +38,8 @@ export interface Passkey {
     credential_id: string;
     device_name: string | null;
     created_at: number;
+    rp_id?: string | null;
+    is_current_rp?: boolean;
 }
 
 // Serialise an ArrayBuffer (or BufferSource) to base64url without padding
@@ -317,7 +319,7 @@ export const authService = {
         if (!res.ok) throw await apiErrorFrom(res);
     },
 
-    async passkeyAuthOptions(username?: string): Promise<{ challengeToken: string; challenge: string; credentialIds: string[] }> {
+    async passkeyAuthOptions(username?: string): Promise<{ challengeToken: string; challenge: string; credentialIds: string[]; rpId?: string }> {
         const res = await apiFetch('/api/auth/passkey-options', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

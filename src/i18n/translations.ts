@@ -710,6 +710,9 @@ export const TRANSLATIONS_BASE = {
         "auth.setup_2fa_required": "为保障账户安全，请在继续之前设置双重认证（TOTP 或通行密钥）。",
 
         "account.passkey_desc": "使用生物识别或安全密钥免密登录",
+        "account.passkey_domain_hint": "通行密钥绑定网站域名。更换域名前，请确认密码、验证器或恢复码可用；新密钥验证成功后再停用旧网站。",
+        "account.passkey_migration_hint": "检测到其他域名或归属未知的密钥，不能用于当前域名。请保留恢复方式，并为当前域名添加新密钥。",
+        "account.passkey_other_domain": "不适用于当前域名，需要重新登记",
         "account.passkey_add": "添加通行密钥",
         "account.passkey_add_another": "添加另一个通行密钥",
         "account.passkey_empty": "暂无注册的通行密钥",
@@ -1597,6 +1600,9 @@ export const TRANSLATIONS_BASE = {
         "auth.setup_2fa_required": "To protect your account, please set up two-factor authentication (TOTP or passkey) before continuing.",
 
         "account.passkey_desc": "Sign in without a password using biometrics or a security key",
+        "account.passkey_domain_hint": "Passkeys belong to a domain. Before moving, check your password, authenticator or recovery codes; verify a new passkey before retiring the old site.",
+        "account.passkey_migration_hint": "Some passkeys belong to another or unknown domain and cannot sign in here. Keep your recovery method and add a passkey for this domain.",
+        "account.passkey_other_domain": "Unavailable on this domain; register a new passkey",
         "account.passkey_add": "Add Passkey",
         "account.passkey_add_another": "Add Another Passkey",
         "account.passkey_empty": "No passkeys registered",

@@ -248,7 +248,7 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
                 setPasskeys(left);
                 // Dropping the last passkey can take the account back to a
                 // single factor, so the parent's badge has to hear about it.
-                onStatusChange(totpEnabled === true || left.length > 0);
+                onStatusChange(totpEnabled === true || left.some(p => p.is_current_rp !== false));
             }
             setPwPrompt(null);
         } catch (e: any) {
@@ -301,7 +301,7 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
             await authService.disable2FA(token, disablePassword, disableCode);
             setTotpEnabled(false);
             // Any remaining passkey still makes this a two-factor account.
-            onStatusChange(passkeys.length > 0);
+            onStatusChange(passkeys.some(pk => pk.is_current_rp !== false));
             showDialog('alert', t('account.2fa_disabled_success'));
             onBack();
         } catch (e: any) {
@@ -559,6 +559,10 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
                 {activeTab === 'passkey' && (
                     <div className="space-y-5">
                         <p className={`text-xs ${muted}`}>{t('account.passkey_desc')}</p>
+                        <p className={`text-xs ${muted}`}>{t('account.passkey_domain_hint')}</p>
+                        {passkeys.some(pk => pk.is_current_rp === false) && (
+                            <p className="text-xs text-[var(--danger)]" role="status">{t('account.passkey_migration_hint')}</p>
+                        )}
 
                         <ErrLine msg={passkeyError} />
                         {passkeySuccess && (
@@ -587,6 +591,10 @@ const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ token, enabled, onStatusC
                                         <div className="flex-1 min-w-0">
                                             <p className={`text-sm font-medium ${on} truncate`}>{pk.device_name || t('session.unknown_device')}</p>
                                             <p className={`text-xs ${muted}`}>{formatRelative(pk.created_at, Math.floor(Date.now() / 1000), t)}</p>
+                                            {pk.rp_id && <p className={`text-xs ${muted} break-all`}>RP ID: {pk.rp_id}</p>}
+                                            {pk.is_current_rp === false && (
+                                                <p className="text-xs text-[var(--danger)]">{t('account.passkey_other_domain')}</p>
+                                            )}
                                         </div>
                                         <button
                                             onClick={() => handleDeletePasskey(pk)}
