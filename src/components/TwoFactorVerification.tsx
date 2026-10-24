@@ -21,14 +21,26 @@ export function useTwoFactorVerification(identity: string, token?: string | null
     const cancel = () => { generation.current++; controller.current?.abort(); };
     const reset = () => { cancel(); setMethods([]); setRequired(false); setCode(''); setSelected('totp'); };
     useEffect(() => {
+        cancel();
+        if (!token) {
+            reset();
+            setStatus('ready');
+        }
+    }, [identity]);
+    useEffect(() => {
         reset();
         if (!token) { setStatus('ready'); return cancel; }
         let active = true;
         setStatus('loading');
         authService.get2FAStatus(token).then(s => {
             if (!active) return;
+            if (typeof s.enabled !== 'boolean' || typeof s.totp !== 'boolean' || typeof s.passkey !== 'boolean'
+                || s.enabled !== (s.totp || s.passkey)) {
+                setStatus('error');
+                return;
+            }
             const available: FactorMethod[] = [];
-            if (s.totp || (s.enabled && s.totp === undefined && !s.passkey)) available.push('totp');
+            if (s.totp) available.push('totp');
             if (s.passkey) available.push('passkey');
             setMethods(available);
             setRequired(s.enabled || available.length > 0);
@@ -36,14 +48,19 @@ export function useTwoFactorVerification(identity: string, token?: string | null
             setStatus('ready');
         }).catch(() => { if (active) setStatus('error'); });
         return () => { active = false; cancel(); };
-    }, [identity, token, retry]);
+    }, [token, retry]);
     const acceptError = (error: any) => {
         if (!error?.needs2FA && error?.code !== 'TWO_FACTOR_REQUIRED') return false;
         const available = factorMethods(error);
         setRequired(true);
-        setMethods(available);
-        setSelected(available[0] ?? 'backup');
         setCode('');
+        if (available.length) {
+            setMethods(available);
+            setSelected(current => available.includes(current as FactorMethod) ? current : available[0]);
+            setStatus('ready');
+        } else {
+            setStatus('error');
+        }
         return true;
     };
     const run = async <T,>(task: (signal: AbortSignal, check: () => void) => Promise<T>) => {
@@ -72,7 +89,7 @@ export function useTwoFactorVerification(identity: string, token?: string | null
         retry: () => setRetry(n => n + 1),
         select: (method: FactorMethod | 'backup') => { cancel(); setSelected(method); setCode(''); },
         setCode,
-        ready: !required || selected === 'passkey' || (selected === 'backup' ? !!code.trim() : /^\d{6}$/.test(code)),
+        ready: status === 'ready' && (!required || selected === 'passkey' || (selected === 'backup' ? !!code.trim() : /^\d{6}$/.test(code))),
     };
 }
 

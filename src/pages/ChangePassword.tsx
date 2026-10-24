@@ -60,16 +60,16 @@ const ChangePassword: React.FC<{ onBack: () => void }> = ({ onBack }) => {
 
                 <div className="space-y-4">
                     <div>
-                        <label className={`block text-xs font-medium mb-1.5 ${muted}`}>{t('account.current_password')}</label>
-                        <input disabled={isLoading} required type="password" value={current} onChange={e => setCurrent(e.target.value)} className={inputCls} autoFocus />
+                        <label htmlFor="change-current-password" className={`block text-xs font-medium mb-1.5 ${muted}`}>{t('account.current_password')}</label>
+                        <input id="change-current-password" disabled={isLoading} required type="password" value={current} onChange={e => setCurrent(e.target.value)} className={inputCls} autoFocus />
                     </div>
                     <div>
-                        <label className={`block text-xs font-medium mb-1.5 ${muted}`}>{t('account.new_password')}</label>
-                        <input disabled={isLoading} required type="password" value={newPass} onChange={e => setNewPass(e.target.value)} className={inputCls} />
+                        <label htmlFor="change-new-password" className={`block text-xs font-medium mb-1.5 ${muted}`}>{t('account.new_password')}</label>
+                        <input id="change-new-password" disabled={isLoading} required type="password" value={newPass} onChange={e => setNewPass(e.target.value)} className={inputCls} />
                     </div>
                     <div>
-                        <label className={`block text-xs font-medium mb-1.5 ${muted}`}>{t('account.confirm_password')}</label>
-                        <input disabled={isLoading} required type="password" value={confirm} onChange={e => setConfirm(e.target.value)} className={inputCls} />
+                        <label htmlFor="change-confirm-password" className={`block text-xs font-medium mb-1.5 ${muted}`}>{t('account.confirm_password')}</label>
+                        <input id="change-confirm-password" disabled={isLoading} required type="password" value={confirm} onChange={e => setConfirm(e.target.value)} className={inputCls} />
                     </div>
                 </div>
 
