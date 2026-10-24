@@ -97,9 +97,10 @@ class Authenticator:
                              "transports": ["usb"]}}
 
     def assertion(self, options, origin=ORIGIN, rp_id=RP_ID, counter=0,
-                  bad_signature=False, user_id=None):
+                  bad_signature=False, user_id=None, user_verified=True):
         client = self.client_data("webauthn.get", options["challenge"], origin)
-        auth = (hashlib.sha256(rp_id.encode()).digest() + b"\x05" +
+        flags = b"\x05" if user_verified else b"\x01"
+        auth = (hashlib.sha256(rp_id.encode()).digest() + flags +
                 struct.pack(">I", counter))
         key = ec.generate_private_key(ec.SECP256R1()) if bad_signature else self.key
         signature = key.sign(auth + hashlib.sha256(client).digest(),
@@ -261,6 +262,76 @@ class ServerSecurityTests(unittest.TestCase):
         return {"challengeToken": options["challengeToken"],
                 "credential": authenticator.assertion(options, **kwargs)}
 
+    def login_options(self, password=PASSWORD, **kwargs):
+        return self.ok("POST", "/api/auth/passkey-options",
+                       {"purpose": "login", "username": self.username,
+                        "password": password}, **kwargs)
+
+    def sensitive_options(self, purpose, password=PASSWORD, token=None, **kwargs):
+        return self.ok("POST", "/api/user/passkey/auth-options",
+                       {"purpose": purpose, "password": password},
+                       self.token if token is None else token, **kwargs)
+
+    def factor_options(self, purpose, **kwargs):
+        if purpose == "login":
+            return self.login_options(**kwargs)
+        return self.sensitive_options(purpose, **kwargs)
+
+    def factor_request(self, purpose, proof=None, password=PASSWORD, token=None,
+                       extra=None, **kwargs):
+        if purpose == "login":
+            method, path = "POST", "/api/login"
+            data = {"username": self.username, "password": password}
+            token = None
+        elif purpose == "password":
+            method, path = "POST", "/api/user/password"
+            data = {"currentPassword": password, "newPassword": NEW_PASSWORD}
+            token = self.token if token is None else token
+        else:
+            self.assertEqual(purpose, "delete")
+            method, path = "DELETE", "/api/user/me"
+            data = {"password": password}
+            token = self.token if token is None else token
+        if proof is not None:
+            data["passkey"] = proof
+        data.update(extra or {})
+        return self.request(method, path, data, token, **kwargs)
+
+    def factor_ok(self, purpose, **kwargs):
+        status, _, payload = self.factor_request(purpose, **kwargs)
+        self.assertEqual(status, 200, (purpose, status, payload))
+        if purpose == "login":
+            self.assertEqual(payload["user"]["id"], self.user_id)
+            self.alive(payload["token"])
+        elif purpose == "password":
+            self.alive(self.token)
+        else:
+            self.assertFalse(self.sql("SELECT id FROM users WHERE id = ?", (self.user_id,)))
+            self.assertFalse(self.sql("SELECT token FROM sessions WHERE user_id = ?", (self.user_id,)))
+            self.assertFalse(self.sql("SELECT id FROM passkeys WHERE user_id = ?", (self.user_id,)))
+            self.expired(self.token)
+        return payload
+
+    def factor_denied(self, purpose, **kwargs):
+        before = self.sql("SELECT password_hash, salt FROM users WHERE id = ?", (self.user_id,))
+        sessions = self.sql("SELECT token FROM sessions WHERE user_id = ? ORDER BY token", (self.user_id,))
+        status, _, payload = self.factor_request(purpose, **kwargs)
+        self.assertIn(status, (400, 401, 403), (purpose, status, payload))
+        self.assertNotIn("token", payload)
+        self.assertEqual(self.sql("SELECT password_hash, salt FROM users WHERE id = ?",
+                                  (self.user_id,)), before)
+        self.assertEqual(self.sql("SELECT token FROM sessions WHERE user_id = ? ORDER BY token",
+                                  (self.user_id,)), sessions)
+        self.alive(self.token)
+        return payload
+
+    def backup_codes(self):
+        secret = self.stored_secret()
+        data = {"password": PASSWORD}
+        if secret:
+            data["code"] = totp(secret)
+        return self.ok("POST", "/api/user/2fa/backup-codes/generate", data, self.token)["codes"]
+
     @contextmanager
     def webauthn_environment(self, **values):
         names = ("PUBLIC_APP_ORIGIN", "WEBAUTHN_ALLOWED_ORIGINS", "WEBAUTHN_RP_ID")
@@ -307,7 +378,9 @@ class ServerSecurityTests(unittest.TestCase):
                     db.executemany("INSERT INTO passkeys VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
                 db.execute("DELETE FROM webauthn_challenges")
                 for rp_id in challenge_rps:
-                    db.execute("INSERT INTO webauthn_challenges VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    db.execute("INSERT INTO webauthn_challenges "
+                               "(token, purpose, user_id, challenge, origin, rp_id, expires_at) "
+                               "VALUES (?, ?, ?, ?, ?, ?, ?)",
                                (uuid.uuid4().hex, "authenticate", self.user_id, b64(os.urandom(32)),
                                 "https://" + rp_id, rp_id, int(time.time()) + 300))
             with self.webauthn_environment(PUBLIC_APP_ORIGIN=public_origin):
@@ -1146,6 +1219,385 @@ class ServerSecurityTests(unittest.TestCase):
             self.alive(self.token)
             self.assertEqual(self.stored_secret(), SECRET)
             self.alive(self.login(totp_code=totp(SECRET)))
+
+    def test_direct_passkey_options_require_user_verification(self):
+        self.enroll()
+        for username in (None, self.username):
+            with self.subTest(username=username):
+                options = self.auth_options(username)
+                self.assertEqual(options["userVerification"], "required")
+                self.assertEqual(self.sql("SELECT purpose FROM webauthn_challenges WHERE token = ?",
+                                          (options["challengeToken"],)), [("authenticate",)])
+
+    def test_direct_passkey_rejects_real_up_only_signature(self):
+        authenticator, _ = self.enroll()
+        for username in (None, self.username):
+            with self.subTest(username=username):
+                options = self.auth_options(username)
+                proof = self.verify(authenticator, options, user_verified=False)
+                self.assertEqual(unb64(proof["credential"]["response"]["authenticatorData"])[32], 1)
+                self.denied("POST", "/api/auth/passkey-verify", proof)
+
+    def test_direct_passkey_client_preference_tampering_cannot_disable_uv(self):
+        authenticator, _ = self.enroll()
+        for preference in ("preferred", "discouraged"):
+            with self.subTest(preference=preference):
+                options = self.auth_options(self.username)
+                options["userVerification"] = preference
+                proof = self.verify(authenticator, options, user_verified=False)
+                proof.update({"userVerification": preference, "requireUV": False,
+                              "require_user_verification": False})
+                self.denied("POST", "/api/auth/passkey-verify", proof)
+
+    def test_passkey_only_password_login_reports_actual_methods(self):
+        self.enroll()
+        self.assertFalse(self.stored_secret())
+        payload = self.factor_denied("login")
+        self.assertTrue(payload["needs2FA"])
+        self.assertEqual(payload["methods"], ["passkey"])
+
+    def test_totp_only_password_login_reports_actual_methods(self):
+        self.enable()
+        payload = self.factor_denied("login")
+        self.assertTrue(payload["needs2FA"])
+        self.assertEqual(payload["methods"], ["totp"])
+        self.factor_ok("login", extra={"totp_code": totp(SECRET)})
+
+    def test_both_factors_password_login_reports_both_methods(self):
+        authenticator, _ = self.enroll()
+        self.enable()
+        payload = self.factor_denied("login")
+        self.assertTrue(payload["needs2FA"])
+        self.assertEqual(payload["methods"], ["totp", "passkey"])
+        self.factor_ok("login", extra={"totp_code": totp(SECRET)})
+        self.factor_ok("login", proof=self.verify(authenticator, self.login_options(), user_verified=False))
+
+    def test_login_passkey_options_require_correct_first_factor(self):
+        self.enroll()
+        for data in ({"purpose": "login", "username": self.username},
+                     {"purpose": "login", "username": self.username, "password": "wrong"},
+                     {"purpose": "login", "username": "missing_" + uuid.uuid4().hex, "password": PASSWORD},
+                     {"purpose": "login", "password": PASSWORD}):
+            with self.subTest(fields=data):
+                before = self.sql("SELECT token FROM webauthn_challenges ORDER BY token")
+                payload = self.denied("POST", "/api/auth/passkey-options", data, self.token)
+                self.assertNotIn("challengeToken", payload)
+                self.assertEqual(self.sql("SELECT token FROM webauthn_challenges ORDER BY token"), before)
+
+    def test_login_passkey_options_are_account_bound_and_preferred(self):
+        authenticator, _ = self.enroll()
+        options = self.login_options()
+        self.assertEqual(options["userVerification"], "preferred")
+        self.assertEqual(self.credential_ids(options), {b64(authenticator.credential_id)})
+        row = self.sql("SELECT purpose, user_id, session_id, origin, rp_id FROM webauthn_challenges "
+                       "WHERE token = ?", (options["challengeToken"],))
+        self.assertEqual(row, [("login", self.user_id, None, ORIGIN, RP_ID)])
+
+    def test_password_plus_passkey_accepts_real_up_only_signature(self):
+        authenticator, _ = self.enroll()
+        proof = self.verify(authenticator, self.login_options(), user_verified=False)
+        self.factor_ok("login", proof=proof)
+        self.assertFalse(self.sql("SELECT token FROM webauthn_challenges WHERE token = ?",
+                                  (proof["challengeToken"],)))
+
+    def test_password_plus_passkey_login_challenge_is_one_use(self):
+        authenticator, _ = self.enroll()
+        proof = self.verify(authenticator, self.login_options(), user_verified=False)
+        self.factor_ok("login", proof=proof)
+        self.factor_denied("login", proof=proof)
+
+    def test_login_challenge_cannot_use_direct_verify_even_with_uv(self):
+        authenticator, _ = self.enroll()
+        for user_verified in (False, True):
+            with self.subTest(user_verified=user_verified):
+                proof = self.verify(authenticator, self.login_options(), user_verified=user_verified)
+                self.denied("POST", "/api/auth/passkey-verify", proof)
+
+    def test_direct_challenge_cannot_replace_login_second_factor(self):
+        authenticator, _ = self.enroll()
+        proof = self.verify(authenticator, self.auth_options(self.username))
+        self.factor_denied("login", proof=proof)
+
+    def test_direct_login_session_token_cannot_replace_raw_factor_proof(self):
+        authenticator, _ = self.enroll()
+        result = self.ok("POST", "/api/auth/passkey-verify",
+                         self.verify(authenticator, self.auth_options(self.username)))
+        for purpose in ("login", "password", "delete"):
+            for proof in (result["token"], {"token": result["token"]},
+                          {"proofToken": result["token"]}):
+                with self.subTest(purpose=purpose, shape=type(proof).__name__):
+                    self.factor_denied(purpose, proof=proof)
+
+    def test_sensitive_options_require_session_password_and_valid_purpose(self):
+        self.enroll()
+        for purpose in ("password", "delete"):
+            for token, data in ((None, {"purpose": purpose, "password": PASSWORD}),
+                                (self.token, {"purpose": purpose}),
+                                (self.token, {"purpose": purpose, "password": "wrong"})):
+                with self.subTest(purpose=purpose, authenticated=bool(token), fields=data):
+                    payload = self.denied("POST", "/api/user/passkey/auth-options", data, token)
+                    self.assertNotIn("challengeToken", payload)
+        for purpose in (None, "login", "authenticate", "register", "invalid"):
+            with self.subTest(purpose=purpose):
+                self.denied("POST", "/api/user/passkey/auth-options",
+                            {"purpose": purpose, "password": PASSWORD}, self.token)
+        for purpose in ("password", "delete", "register", "invalid"):
+            with self.subTest(public_purpose=purpose):
+                self.denied("POST", "/api/auth/passkey-options",
+                            {"purpose": purpose, "username": self.username, "password": PASSWORD})
+
+    def test_sensitive_options_bind_user_session_purpose_and_prefer_uv(self):
+        authenticator, _ = self.enroll()
+        for purpose in ("password", "delete"):
+            with self.subTest(purpose=purpose):
+                options = self.sensitive_options(purpose)
+                self.assertEqual(options["userVerification"], "preferred")
+                self.assertEqual(self.credential_ids(options), {b64(authenticator.credential_id)})
+                self.assertEqual(self.sql("SELECT purpose, user_id, session_id, origin, rp_id "
+                                          "FROM webauthn_challenges WHERE token = ?",
+                                          (options["challengeToken"],)),
+                                 [(purpose, self.user_id, self.sid(self.token), ORIGIN, RP_ID)])
+
+    def test_passkey_only_sensitive_operations_require_factor(self):
+        self.enroll()
+        for purpose in ("password", "delete"):
+            with self.subTest(purpose=purpose):
+                payload = self.factor_denied(purpose)
+                self.assertTrue(payload["needs2FA"])
+                self.assertEqual(payload["methods"], ["passkey"])
+
+    def test_sensitive_password_change_accepts_up_only_and_revokes_other_sessions(self):
+        other = self.login()
+        authenticator, _ = self.enroll()
+        proof = self.verify(authenticator, self.sensitive_options("password"), user_verified=False)
+        self.factor_ok("password", proof=proof)
+        self.expired(other)
+        self.factor_denied("login", password=PASSWORD)
+        self.factor_ok("login", password=NEW_PASSWORD,
+                       proof=self.verify(authenticator, self.login_options(password=NEW_PASSWORD), user_verified=False))
+
+    def test_sensitive_password_change_challenge_replay_rejected(self):
+        authenticator, _ = self.enroll()
+        proof = self.verify(authenticator, self.sensitive_options("password"), user_verified=False)
+        self.factor_ok("password", proof=proof)
+        self.assertFalse(self.sql("SELECT token FROM webauthn_challenges WHERE token = ?",
+                                  (proof["challengeToken"],)))
+        self.factor_denied("password", password=NEW_PASSWORD, proof=proof)
+
+    def test_sensitive_delete_accepts_up_only_and_revokes_all_sessions(self):
+        other = self.login()
+        authenticator, _ = self.enroll()
+        proof = self.verify(authenticator, self.sensitive_options("delete"), user_verified=False)
+        self.factor_ok("delete", proof=proof)
+        self.expired(other)
+        self.denied("DELETE", "/api/user/me", {"password": PASSWORD, "passkey": proof}, self.token)
+
+    def test_sensitive_final_request_still_requires_current_password(self):
+        authenticator, _ = self.enroll()
+        for purpose in ("login", "password", "delete"):
+            for password in ("", "wrong"):
+                with self.subTest(purpose=purpose, password=password):
+                    proof = self.verify(authenticator, self.factor_options(purpose), user_verified=False)
+                    self.factor_denied(purpose, proof=proof, password=password)
+
+    def test_factor_challenges_cannot_cross_purposes(self):
+        authenticator, _ = self.enroll()
+        for source in ("login", "password", "delete"):
+            for target in ("login", "password", "delete"):
+                if source == target:
+                    continue
+                with self.subTest(source=source, target=target):
+                    proof = self.verify(authenticator, self.factor_options(source))
+                    self.factor_denied(target, proof=proof)
+        for purpose in ("password", "delete"):
+            for options in (self.auth_options(self.username), self.register_options()):
+                with self.subTest(target=purpose, token=options["challengeToken"]):
+                    self.factor_denied(purpose, proof=self.verify(authenticator, options))
+
+    def test_sensitive_challenges_cannot_use_direct_verify(self):
+        authenticator, _ = self.enroll()
+        for purpose in ("password", "delete"):
+            with self.subTest(purpose=purpose):
+                self.denied("POST", "/api/auth/passkey-verify",
+                            self.verify(authenticator, self.sensitive_options(purpose)))
+
+    def test_sensitive_challenges_reject_other_session_of_same_user(self):
+        other = self.login()
+        authenticator, _ = self.enroll()
+        for purpose in ("password", "delete"):
+            with self.subTest(purpose=purpose):
+                proof = self.verify(authenticator, self.sensitive_options(purpose), user_verified=False)
+                self.factor_denied(purpose, proof=proof, token=other)
+                self.alive(other)
+
+    def test_factor_challenges_reject_foreign_credential(self):
+        self.enroll()
+        stranger = self.ok("POST", "/api/register",
+                           {"username": uuid.uuid4().hex, "password": PASSWORD})
+        authenticator = Authenticator()
+        options = self.ok("POST", "/api/user/passkey/register-options", {}, stranger["token"])
+        self.ok("POST", "/api/user/passkey/register",
+                {"password": PASSWORD, "challengeToken": options["challengeToken"],
+                 "credential": authenticator.registration(options)}, stranger["token"])
+        for purpose in ("login", "password", "delete"):
+            with self.subTest(purpose=purpose):
+                self.factor_denied(purpose, proof=self.verify(authenticator, self.factor_options(purpose)))
+
+    def test_factor_challenges_reject_other_account_binding(self):
+        authenticator, _ = self.enroll()
+        stranger_name = uuid.uuid4().hex
+        stranger = self.ok("POST", "/api/register", {"username": stranger_name, "password": PASSWORD})
+        for purpose in ("login", "password", "delete"):
+            with self.subTest(purpose=purpose):
+                if purpose == "login":
+                    options = self.ok("POST", "/api/auth/passkey-options",
+                                      {"purpose": purpose, "username": stranger_name, "password": PASSWORD})
+                else:
+                    options = self.sensitive_options(purpose, token=stranger["token"])
+                self.factor_denied(purpose, proof=self.verify(authenticator, options))
+
+    def test_factor_challenges_reject_expiration(self):
+        authenticator, _ = self.enroll()
+        for purpose in ("login", "password", "delete"):
+            with self.subTest(purpose=purpose):
+                options = self.factor_options(purpose)
+                self.sql("UPDATE webauthn_challenges SET expires_at = ? WHERE token = ?",
+                         (int(time.time()) - 60, options["challengeToken"]))
+                self.factor_denied(purpose, proof=self.verify(authenticator, options))
+
+    def test_factor_challenges_reject_invalid_crypto(self):
+        authenticator, _ = self.enroll()
+        for purpose in ("login", "password", "delete"):
+            for kwargs in ({"bad_signature": True}, {"rp_id": "evil.example"},
+                           {"origin": "https://evil.example"}):
+                with self.subTest(purpose=purpose, kwargs=kwargs):
+                    self.factor_denied(purpose, proof=self.verify(authenticator, self.factor_options(purpose),
+                                                                  user_verified=False, **kwargs))
+
+    def test_factor_challenges_reject_assertion_for_different_challenge(self):
+        authenticator, _ = self.enroll()
+        for purpose in ("login", "password", "delete"):
+            with self.subTest(purpose=purpose):
+                proof = self.verify(authenticator, self.factor_options(purpose))
+                proof["challengeToken"] = self.factor_options(purpose)["challengeToken"]
+                self.factor_denied(purpose, proof=proof)
+
+    def test_factor_challenges_cannot_move_between_allowed_origins(self):
+        authenticator, _ = self.enroll()
+        second = "https://app.hrt.example"
+        with self.webauthn_config((ORIGIN, second), RP_ID):
+            for purpose in ("login", "password", "delete"):
+                for request_origin, client_origin in ((second, ORIGIN), (second, second), (ORIGIN, second)):
+                    with self.subTest(purpose=purpose, request_origin=request_origin, client_origin=client_origin):
+                        proof = self.verify(authenticator, self.factor_options(purpose), origin=client_origin)
+                        self.factor_denied(purpose, proof=proof, origin=request_origin)
+
+    def test_factor_challenges_reject_changed_rp_even_for_rebound_key(self):
+        authenticator, pk_id = self.enroll()
+        origin = "https://app.hrt.example"
+        for purpose in ("login", "password", "delete"):
+            with self.subTest(purpose=purpose):
+                self.sql("UPDATE passkeys SET rp_id = ? WHERE id = ?", (RP_ID, pk_id))
+                with self.webauthn_config((origin,), RP_ID):
+                    options = self.factor_options(purpose, origin=origin)
+                self.sql("UPDATE passkeys SET rp_id = ? WHERE id = ?", ("app.hrt.example", pk_id))
+                with self.webauthn_config((origin,), "app.hrt.example"):
+                    proof = self.verify(authenticator, options, origin=origin, rp_id="app.hrt.example")
+                    self.factor_denied(purpose, proof=proof, origin=origin)
+
+    def test_factor_proof_requires_credential_not_just_identifier_or_token(self):
+        authenticator, _ = self.enroll()
+        for purpose in ("login", "password", "delete"):
+            for shape in ("token", "id", "missing-token"):
+                with self.subTest(purpose=purpose, shape=shape):
+                    options = self.factor_options(purpose)
+                    proof = self.verify(authenticator, options)
+                    if shape == "token":
+                        proof.pop("credential")
+                    elif shape == "id":
+                        proof["credential"] = {"id": b64(authenticator.credential_id)}
+                    else:
+                        proof.pop("challengeToken")
+                    self.factor_denied(purpose, proof=proof)
+
+    def test_passkey_factor_invalid_attempt_consumes_challenge(self):
+        authenticator, _ = self.enroll()
+        for purpose in ("login", "password", "delete"):
+            with self.subTest(purpose=purpose):
+                options = self.factor_options(purpose)
+                self.factor_denied(purpose, proof=self.verify(authenticator, options, bad_signature=True))
+                self.factor_denied(purpose, proof=self.verify(authenticator, options))
+
+    def test_old_sensitive_challenges_cannot_survive_password_change(self):
+        authenticator, _ = self.enroll()
+        stale = {purpose: self.verify(authenticator, self.sensitive_options(purpose), user_verified=False)
+                 for purpose in ("password", "delete")}
+        fresh = self.verify(authenticator, self.sensitive_options("password"), user_verified=False)
+        self.factor_ok("password", proof=fresh)
+        for purpose, proof in stale.items():
+            with self.subTest(purpose=purpose):
+                self.factor_denied(purpose, proof=proof, password=NEW_PASSWORD)
+
+    def test_totp_can_replace_passkey_for_sensitive_password_change(self):
+        self.enroll()
+        self.enable()
+        self.factor_ok("password", extra={"code": totp(SECRET)})
+        self.factor_ok("login", password=NEW_PASSWORD, extra={"totp_code": totp(SECRET)})
+
+    def test_totp_can_replace_passkey_for_sensitive_delete(self):
+        self.enroll()
+        self.enable()
+        self.factor_ok("delete", extra={"code": totp(SECRET)})
+
+    def test_passkey_can_replace_totp_for_sensitive_password_change(self):
+        authenticator, _ = self.enroll()
+        self.enable()
+        self.factor_ok("password", proof=self.verify(authenticator, self.sensitive_options("password"),
+                                                     user_verified=False))
+
+    def test_passkey_can_replace_totp_for_sensitive_delete(self):
+        authenticator, _ = self.enroll()
+        self.enable()
+        self.factor_ok("delete", proof=self.verify(authenticator, self.sensitive_options("delete"),
+                                                   user_verified=False))
+
+    def test_backup_code_can_replace_passkey_for_login_and_is_one_use(self):
+        self.enroll()
+        code = self.backup_codes()[0]
+        self.factor_ok("login", extra={"backup_code": code})
+        self.factor_denied("login", extra={"backup_code": code})
+
+    def test_backup_code_can_replace_passkey_for_password_change_and_is_one_use(self):
+        self.enroll()
+        code = self.backup_codes()[0]
+        self.factor_ok("password", extra={"backup_code": code})
+        self.factor_denied("password", password=NEW_PASSWORD, extra={"backup_code": code})
+
+    def test_backup_code_can_replace_passkey_for_account_delete(self):
+        self.enroll()
+        self.factor_ok("delete", extra={"backup_code": self.backup_codes()[0]})
+
+    def test_invalid_totp_and_backup_codes_cannot_bypass_passkey_only_factor(self):
+        self.enroll()
+        for purpose in ("login", "password", "delete"):
+            for extra in ({"code": totp(SECRET)}, {"totp_code": totp(SECRET)},
+                          {"backup_code": "NOT-A-VALID-RECOVERY-CODE"}):
+                with self.subTest(purpose=purpose, extra=extra):
+                    self.factor_denied(purpose, extra=extra)
+
+    def test_first_passkey_enrollment_issues_recovery_codes_without_overwriting_existing_codes(self):
+        self.enroll()
+        codes = self.sql('SELECT backup_codes FROM users WHERE id = ?', (self.user_id,))[0][0]
+        self.assertEqual(len(json.loads(codes)), 8)
+        self.enroll()
+        self.assertEqual(self.sql('SELECT backup_codes FROM users WHERE id = ?', (self.user_id,))[0][0], codes)
+
+    def test_no_factor_account_password_change_still_works(self):
+        self.factor_ok("password")
+        self.alive(self.login(NEW_PASSWORD))
+
+    def test_no_factor_account_delete_still_works(self):
+        self.factor_ok("delete")
 
 
 if __name__ == "__main__":

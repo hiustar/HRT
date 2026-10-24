@@ -688,19 +688,22 @@ async function verifyPasskeyAssertion(
   expectedOrigin: string,
   expectedRpId: string,
   expectedChallenge: string,
+  requireUV = true,
 ): Promise<number> {
   const clientData = JSON.parse(new TextDecoder().decode(b64urlDecode(clientDataJSONb64)));
   if (clientData.type !== 'webauthn.get') throw new Error('Wrong type');
   // Normalise challenge to base64url without padding before comparing
   const received = clientData.challenge.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
   if (received !== expectedChallenge.replace(/=/g, '')) throw new Error('Challenge mismatch');
-  if (clientData.origin !== expectedOrigin) throw new Error('Origin mismatch');
+  if (clientData.origin !== expectedOrigin || clientData.crossOrigin === true) throw new Error('Origin mismatch');
 
   const authBytes = b64urlDecode(authenticatorDatab64);
+  if (authBytes.length < 37) throw new Error('Truncated authenticator data');
   const { rpIdHash, flags, signCount } = parseAuthData(authBytes);
   const rpHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(expectedRpId)));
   if (!rpIdHash.every((v, i) => v === rpHash[i])) throw new Error('RP ID mismatch');
   if (!(flags & 1)) throw new Error('User presence not set');
+  if (requireUV && !(flags & 4)) throw new Error('User verification not set');
 
   // Verification data = authData || SHA-256(clientDataJSON)
   const clientHash = new Uint8Array(await crypto.subtle.digest('SHA-256', b64urlDecode(clientDataJSONb64)));
@@ -717,8 +720,86 @@ async function verifyPasskeyAssertion(
   if (!valid) throw new Error('Signature invalid');
 
   // Counter must advance (0 means counter not implemented — allow)
-  if (storedCounter > 0 && signCount > 0 && storedCounter >= signCount) throw new Error('Counter not advancing (cloned authenticator?)');
+  if ((storedCounter > 0 || signCount > 0) && storedCounter >= signCount) throw new Error('Counter not advancing (cloned authenticator?)');
   return signCount;
+}
+
+interface SecondFactor {
+  code?: string;
+  backup_code?: string;
+  passkey?: { challengeToken: string; credential: object };
+}
+
+type AuthPurpose = 'direct' | 'login' | 'password' | 'delete';
+interface AuthChallenge {
+  challenge: string;
+  purpose: AuthPurpose;
+  origin: string;
+  rpId: string;
+  uid: string | null;
+  sid: string | null;
+  passwordHash: string | null;
+}
+
+async function createAuthOptions(env: Env, request: Request, purpose: AuthPurpose, user?: any, sid?: string) {
+  // Preserve the worker's existing origin selection (not the Python deployment configuration).
+  const origin = request.headers.get('Origin') || `https://${new URL(request.url).hostname}`;
+  const challenge = b64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
+  const challengeToken = b64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
+  const payload: AuthChallenge = {
+    challenge, purpose, origin, rpId: new URL(origin).hostname,
+    uid: user?.id ?? null, sid: sid ?? null,
+    passwordHash: purpose === 'direct' ? null : user.password_hash,
+  };
+  const now = Math.floor(Date.now() / 1000);
+  const rows = user ? await env.DB.prepare('SELECT credential_id FROM passkeys WHERE user_id = ?').bind(user.id).all() : null;
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM auth_challenges WHERE expires_at <= ?').bind(now),
+    env.DB.prepare('INSERT INTO auth_challenges (token_hash, payload_json, user_id, expires_at) VALUES (?, ?, ?, ?)')
+      .bind(await sha256Hex(challengeToken), JSON.stringify(payload), payload.uid, now + 300),
+  ]);
+  return { challengeToken, challenge, credentialIds: (rows?.results ?? []).map((r: any) => r.credential_id),
+    rpId: payload.rpId, userVerification: purpose === 'direct' ? 'required' : 'preferred' };
+}
+
+async function verifyAuthProof(env: Env, proof: SecondFactor['passkey'], purpose: AuthPurpose, user?: any, sid?: string): Promise<any> {
+  if (!proof || typeof proof.challengeToken !== 'string' || !isJsonObject(proof.credential)) throw new Error('Missing passkey proof');
+  const credential = proof.credential;
+  if (typeof credential.id !== 'string' || !isJsonObject(credential.response)) throw new Error('Invalid credential');
+  // DELETE RETURNING is the single-use gate, including for zero-counter authenticators.
+  // Old signed direct-login challenges are intentionally not accepted after migration.
+  const row = await env.DB.prepare('DELETE FROM auth_challenges WHERE token_hash = ? AND expires_at > ? RETURNING payload_json')
+    .bind(await sha256Hex(proof.challengeToken), Math.floor(Date.now() / 1000)).first<{ payload_json: string }>();
+  if (!row) throw new Error('Expired or consumed challenge');
+  const bound = JSON.parse(row.payload_json) as AuthChallenge;
+  if (bound.purpose !== purpose || (purpose !== 'direct' && (bound.uid !== user?.id || bound.passwordHash !== user?.password_hash)) ||
+      ((purpose === 'password' || purpose === 'delete') && (!sid || bound.sid !== sid))) throw new Error('Challenge binding mismatch');
+  const key = await env.DB.prepare('SELECT * FROM passkeys WHERE credential_id = ?').bind(credential.id).first() as any;
+  if (!key || (bound.uid && key.user_id !== bound.uid)) throw new Error('Credential account mismatch');
+  const owner = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(key.user_id).first() as any;
+  if (!owner || (purpose !== 'direct' && owner.password_hash !== bound.passwordHash)) throw new Error('Password changed');
+  const counter = await verifyPasskeyAssertion(credential.response.clientDataJSON, credential.response.authenticatorData,
+    credential.response.signature, key.public_key_x, key.public_key_y, key.counter, bound.origin, bound.rpId, bound.challenge, purpose === 'direct');
+  const advanced = await env.DB.prepare('UPDATE passkeys SET counter = ? WHERE id = ? AND counter = ?')
+    .bind(counter, key.id, key.counter).run();
+  if (advanced.meta.changes !== 1) throw new Error('Credential counter changed concurrently');
+  return owner;
+}
+
+async function factorMethods(env: Env, user: any): Promise<Array<'totp' | 'passkey'>> {
+  const methods: Array<'totp' | 'passkey'> = [];
+  if (user.totp_secret) methods.push('totp');
+  if (await env.DB.prepare('SELECT id FROM passkeys WHERE user_id = ? LIMIT 1').bind(user.id).first()) methods.push('passkey');
+  return methods;
+}
+
+async function verifySecondFactor(env: Env, user: any, proof: SecondFactor, purpose: Exclude<AuthPurpose, 'direct'>, jwtSecret: string, sid?: string): Promise<boolean> {
+  if (proof.passkey) {
+    try { await verifyAuthProof(env, proof.passkey, purpose, user, sid); return true; } catch { return false; }
+  }
+  if (typeof proof.backup_code === 'string' && proof.backup_code) return verifyAndConsumeBackupCode(env, user.id, proof.backup_code, jwtSecret);
+  if (typeof proof.code === 'string' && user.totp_secret) return consumeTOTP(env, user.id, user.totp_secret, proof.code);
+  return false;
 }
 
 export default {
@@ -940,7 +1021,9 @@ export default {
       if (url.pathname === '/api/login' && request.method === 'POST') {
         const body = await request.json() as any;
         let { username, password, totp_code, backup_code } = body;
-        if (!username || !password) return jsonError('INVALID_REQUEST', 'Missing credentials', 400);
+        if (typeof username !== 'string' || typeof password !== 'string' || !username || !password || password.length > MAX_PASSWORD_LENGTH) {
+          return jsonError('INVALID_REQUEST', 'Missing or invalid credentials', 400);
+        }
         username = username.trim();
 
         // Per-account throttle, keyed on nothing the caller can rotate. The IP
@@ -977,40 +1060,17 @@ export default {
           return jsonError('INVALID_CREDENTIALS', 'Invalid credentials', 401);
         }
 
-        // 2FA check
-        const userWithTotp = await env.DB.prepare('SELECT totp_secret FROM users WHERE id = ?').bind(user.id).first() as any;
-        let twoFAVerified = false;
-        if (userWithTotp?.totp_secret) {
-          // TOTP is enabled — accept totp_code or backup_code
-          if (!totp_code && !backup_code) {
-            return withSecurityHeaders(new Response(JSON.stringify({ code: 'TWO_FACTOR_REQUIRED', message: 'A second factor is required', needs2FA: true, method: 'totp' }), {
-              status: 401,
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        const methods = await factorMethods(env, user);
+        const proof: SecondFactor = { code: body.code ?? totp_code, backup_code, passkey: body.passkey };
+        if (methods.length > 0) {
+          if (!proof.code && !proof.backup_code && !proof.passkey) {
+            return withSecurityHeaders(new Response(JSON.stringify({ code: 'TWO_FACTOR_REQUIRED', message: 'A second factor is required',
+              needs2FA: true, method: methods[0], methods }), {
+              status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
             }));
           }
-          if (backup_code) {
-            const backupValid = await verifyAndConsumeBackupCode(env, user.id, String(backup_code), jwtSecret);
-            if (!backupValid) return jsonError('TWO_FACTOR_INVALID', 'Invalid or already-used backup code', 401);
-          } else {
-            const totpValid = await consumeTOTP(env, user.id, userWithTotp.totp_secret, String(totp_code));
-            if (!totpValid) return jsonError('TWO_FACTOR_INVALID', 'Invalid 2FA code', 401);
-          }
-          twoFAVerified = true;
-        } else {
-          // No TOTP: check if user has any passkeys registered
-          const pkRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM passkeys WHERE user_id = ?').bind(user.id).first() as any;
-          if ((pkRow?.cnt ?? 0) > 0) {
-            // Passkey-only 2FA — accept backup_code as fallback
-            if (backup_code) {
-              const backupValid = await verifyAndConsumeBackupCode(env, user.id, String(backup_code), jwtSecret);
-              if (!backupValid) return jsonError('TWO_FACTOR_INVALID', 'Invalid or already-used backup code', 401);
-            } else {
-              return withSecurityHeaders(new Response(JSON.stringify({ code: 'TWO_FACTOR_REQUIRED', message: 'A second factor is required', needs2FA: true, method: 'passkey' }), {
-                status: 401,
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-              }));
-            }
-            twoFAVerified = true;
+          if (!(await verifySecondFactor(env, user, proof, 'login', jwtSecret))) {
+            return jsonError('TWO_FACTOR_INVALID', 'Invalid second factor', 401);
           }
         }
 
@@ -1019,14 +1079,15 @@ export default {
         const userAgent = (request.headers.get('User-Agent') || 'Unknown').slice(0, 500);
         const loginIP = request.headers.get('CF-Connecting-IP') ||
           request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
-        await env.DB.prepare('INSERT INTO sessions (id, user_id, device_info, ip) VALUES (?, ?, ?, ?)')
-          .bind(sessionId, user.id, userAgent, loginIP).run();
+        const issued = await env.DB.prepare(`INSERT INTO sessions (id, user_id, device_info, ip)
+          SELECT ?, id, ?, ? FROM users WHERE id = ? AND password_hash = ?`)
+          .bind(sessionId, userAgent, loginIP, user.id, user.password_hash).run();
+        if (issued.meta.changes !== 1) return jsonError('INVALID_CREDENTIALS', 'Credentials changed; sign in again', 401);
 
         const secret = new TextEncoder().encode(jwtSecret);
         const token = await new SignJWT({ sub: user.id, username: user.username, role: 'user', sid: sessionId }).setProtectedHeader({ alg: 'HS256' }).setIssuedAt().setExpirationTime('7d').sign(secret);
         const loginResp: Record<string, any> = { token, user: { id: user.id, username: user.username, isAdmin: false } };
         // 2FA setup is optional — do not force users to configure it on login.
-        void twoFAVerified;
         return withSecurityHeaders(new Response(JSON.stringify(loginResp), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }));
       }
 
@@ -1055,34 +1116,33 @@ export default {
 
       // POST /api/auth/passkey-options — generate WebAuthn auth challenge (public, no JWT)
       if (url.pathname === '/api/auth/passkey-options' && request.method === 'POST') {
-        const clientIP = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
+        const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
         if (!(await checkRateLimit(env, `passkey-options:${clientIP}`, 10))) {
           return jsonError('RATE_LIMITED', 'Too many requests', 429, { 'Retry-After': '60' });
         }
-        const { username } = (await request.json().catch(() => ({}))) as any;
-        const origin = request.headers.get('Origin') || `https://${url.hostname}`;
-        const challenge = b64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
-        const secret = new TextEncoder().encode(jwtSecret);
-
-        let credentialIds: string[] = [];
-        if (username) {
-          const userRow = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(String(username).trim()).first() as any;
-          if (userRow) {
-            const rows = await env.DB.prepare('SELECT credential_id FROM passkeys WHERE user_id = ?').bind(userRow.id).all();
-            credentialIds = (rows.results || []).map((r: any) => r.credential_id);
-          }
+        const { username, password, purpose } = (await request.json().catch(() => ({}))) as any;
+        if (purpose !== undefined && purpose !== 'login') return jsonError('INVALID_REQUEST', 'Invalid purpose', 400);
+        if (username !== undefined && typeof username !== 'string') return jsonError('INVALID_REQUEST', 'Invalid username', 400);
+        const name = typeof username === 'string' ? username.trim() : '';
+        if (name && !(await checkRateLimit(env, `login-user:${name.toLowerCase()}`, 10))) {
+          return jsonError('RATE_LIMITED', 'Too many attempts for this account', 429, { 'Retry-After': '60' });
         }
-
-        const challengeToken = await new SignJWT({ challenge, purpose: 'passkey-auth', origin })
-          .setProtectedHeader({ alg: 'HS256' }).setExpirationTime('5m').sign(secret);
-        return withSecurityHeaders(new Response(JSON.stringify({ challengeToken, challenge, credentialIds }), {
-          status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        let user = name ? await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(name).first() as any : null;
+        if (purpose === 'login') {
+          if (!name || typeof password !== 'string' || password.length > MAX_PASSWORD_LENGTH) return jsonError('INVALID_REQUEST', 'Missing credentials', 400);
+          const valid = await bcrypt.compare(password, user?.password_hash ?? '$2b$10$BWJX6W9Wa9yJjNiLDyST0.m81EwzBBgeYjAertEWZnx15kTrQABJ.');
+          if (!user || !valid) return jsonError('INVALID_CREDENTIALS', 'Invalid credentials', 401);
+        }
+        const options = await createAuthOptions(env, request, purpose === 'login' ? 'login' : 'direct',
+          user ?? (name ? { id: crypto.randomUUID() } : undefined));
+        return withSecurityHeaders(new Response(JSON.stringify(options), {
+          status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         }));
       }
 
       // POST /api/auth/passkey-verify — verify WebAuthn assertion and issue session JWT (public)
       if (url.pathname === '/api/auth/passkey-verify' && request.method === 'POST') {
-        const clientIP = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
+        const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
         if (!(await checkRateLimit(env, `passkey-verify:${clientIP}`, 10))) {
           return jsonError('RATE_LIMITED', 'Too many requests', 429, { 'Retry-After': '60' });
         }
@@ -1092,39 +1152,9 @@ export default {
         }
 
         const secret = new TextEncoder().encode(jwtSecret);
-        let challengePayload: any;
+        let userRow: any;
         try {
-          const { payload } = await jwtVerify(challengeToken, secret);
-          challengePayload = payload;
-        } catch {
-          return jsonError('INVALID_REQUEST', 'Invalid or expired challenge', 400);
-        }
-        if (challengePayload.purpose !== 'passkey-auth') {
-          return jsonError('INVALID_REQUEST', 'Invalid challenge purpose', 400);
-        }
-
-        const passkeyRow = await env.DB.prepare('SELECT * FROM passkeys WHERE credential_id = ?').bind(credential.id as string).first() as any;
-        if (!passkeyRow) return jsonError('INVALID_CREDENTIALS', 'Passkey not found', 401);
-
-        const userRow = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(passkeyRow.user_id).first() as any;
-        if (!userRow) return jsonError('INVALID_CREDENTIALS', 'User not found', 401);
-
-        const expectedOrigin = challengePayload.origin as string;
-        const expectedRpId = (() => { try { return new URL(expectedOrigin).hostname; } catch { return url.hostname; } })();
-
-        try {
-          const newCounter = await verifyPasskeyAssertion(
-            credential.response.clientDataJSON,
-            credential.response.authenticatorData,
-            credential.response.signature,
-            passkeyRow.public_key_x,
-            passkeyRow.public_key_y,
-            passkeyRow.counter,
-            expectedOrigin,
-            expectedRpId,
-            challengePayload.challenge as string,
-          );
-          await env.DB.prepare('UPDATE passkeys SET counter = ? WHERE id = ?').bind(newCounter, passkeyRow.id).run();
+          userRow = await verifyAuthProof(env, { challengeToken, credential }, 'direct');
         } catch {
           return jsonError('INVALID_CREDENTIALS', 'Passkey verification failed', 401);
         }
@@ -1132,8 +1162,10 @@ export default {
         const sessionId = crypto.randomUUID();
         const userAgent = (request.headers.get('User-Agent') || 'Unknown').slice(0, 500);
         const loginIP = clientIP;
-        await env.DB.prepare('INSERT INTO sessions (id, user_id, device_info, ip) VALUES (?, ?, ?, ?)')
-          .bind(sessionId, userRow.id, userAgent, loginIP).run();
+        const issued = await env.DB.prepare(`INSERT INTO sessions (id, user_id, device_info, ip)
+          SELECT ?, id, ?, ? FROM users WHERE id = ? AND password_hash = ?`)
+          .bind(sessionId, userAgent, loginIP, userRow.id, userRow.password_hash).run();
+        if (issued.meta.changes !== 1) return jsonError('INVALID_CREDENTIALS', 'Credentials changed; sign in again', 401);
 
         const jwtToken = await new SignJWT({ sub: userRow.id, username: userRow.username, role: 'user', sid: sessionId })
           .setProtectedHeader({ alg: 'HS256' }).setIssuedAt().setExpirationTime('7d').sign(secret);
@@ -1280,13 +1312,10 @@ export default {
         const { payload } = await jwtVerify(token, secret);
 
         // jwtVerify only proves "signed with JWT_SECRET" — it says nothing about
-        // what the token is FOR, and this worker signs several kinds with that
-        // one secret. The passkey challenge tokens minted by the *public*,
-        // credential-free /api/auth/passkey-options carry {challenge, purpose,
-        // origin} and nothing else, so without these checks they sailed through
-        // here: `sub` was undefined and, with no `sid`, the revocation and idle
-        // checks below were skipped wholesale. Reject anything that isn't a
-        // session token before it can be treated as one.
+        // what the token is FOR. Legacy signed passkey challenges and registration
+        // challenges must never be accepted as sessions. Authentication challenges
+        // now use opaque single-use database tokens instead; still reject anything
+        // that isn't a session token before it can be treated as one.
         const purpose = (payload as any).purpose;
         const sessionId = (payload as any).sid as string | undefined;
         if (typeof payload.sub !== 'string' || !payload.sub || purpose !== undefined) {
@@ -1594,6 +1623,26 @@ export default {
           }
         }
 
+        // A password-bound passkey proof is usable only by this session and operation.
+        if (url.pathname === '/api/user/passkey/auth-options' && request.method === 'POST') {
+          const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+          if (!(await checkRateLimit(env, `passkey-sensitive-ip:${ip}`, 10)) ||
+              !(await checkRateLimit(env, `passkey-sensitive-user:${userId}`, 10))) {
+            return jsonError('RATE_LIMITED', 'Too many attempts', 429, { 'Retry-After': '60' });
+          }
+          const { purpose, password } = await request.json() as any;
+          if ((purpose !== 'password' && purpose !== 'delete') || typeof password !== 'string' || password.length > MAX_PASSWORD_LENGTH) {
+            return jsonError('INVALID_REQUEST', 'Invalid purpose or password', 400);
+          }
+          if (!sessionId) return jsonError('FORBIDDEN', 'A user session is required', 403);
+          const user = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first() as any;
+          const valid = await bcrypt.compare(password, user?.password_hash ?? '$2b$10$BWJX6W9Wa9yJjNiLDyST0.m81EwzBBgeYjAertEWZnx15kTrQABJ.');
+          if (!user || !valid) return jsonError('INVALID_CREDENTIALS', 'Incorrect password', 401);
+          return withSecurityHeaders(new Response(JSON.stringify(await createAuthOptions(env, request, purpose, user, sessionId)), {
+            status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+          }));
+        }
+
         // Profile / Password / Delete Me
         if (url.pathname.startsWith('/api/user/')) {
           if (url.pathname === '/api/user/profile' && request.method === 'PATCH') {
@@ -1607,8 +1656,10 @@ export default {
           }
 
           if (url.pathname === '/api/user/password' && request.method === 'POST') {
-            const { currentPassword, newPassword } = await request.json() as any;
-            const user = await env.DB.prepare('SELECT password_hash FROM users WHERE id = ?').bind(userId).first() as any;
+            const body = await request.json() as any;
+            const { currentPassword, newPassword } = body;
+            if (typeof currentPassword !== 'string' || currentPassword.length > MAX_PASSWORD_LENGTH) return jsonError('INVALID_REQUEST', 'Invalid password', 400);
+            const user = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first() as any;
 
             const dummyHash = '$2a$10$CCCCCCCCCCCCCCCCCCCCC.O0D3I6./CCCCCCCCCCCCCCCCCCCCCCC';
             const passwordHash = user ? user.password_hash : dummyHash;
@@ -1618,8 +1669,19 @@ export default {
 
             const passVal = validatePassword(newPassword);
             if (!passVal.valid) return jsonError('INVALID_REQUEST', passVal.error!, 400);
+            if (!(await checkRateLimit(env, `sensitive-factor:${userId}`, 10))) return jsonError('RATE_LIMITED', 'Too many attempts', 429);
+            const methods = await factorMethods(env, user);
+            if (methods.length > 0) {
+              if (!body.code && !body.backup_code && !body.passkey) return withSecurityHeaders(new Response(JSON.stringify({
+                code: 'TWO_FACTOR_REQUIRED', message: 'A second factor is required', needs2FA: true, method: methods[0], methods,
+              }), { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } }));
+              if (!(await verifySecondFactor(env, user, body, 'password', jwtSecret, sessionId))) return jsonError('TWO_FACTOR_INVALID', 'Invalid second factor', 401);
+            }
             const hashed = await bcrypt.hash(newPassword, 10);
-            await env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?').bind(hashed, userId).run();
+            const updated = await env.DB.prepare(`UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?
+              AND (? IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ?))`)
+              .bind(hashed, userId, user.password_hash, sessionId ?? null, sessionId ?? null, userId).run();
+            if (updated.meta.changes !== 1) return jsonError('INVALID_CREDENTIALS', 'Credentials changed; sign in again', 401);
             // Changing the password is the standard response to "someone has my
             // account", so it has to invalidate whatever they took. Without this
             // a stolen 7-day JWT kept working after the change — and every
@@ -1632,8 +1694,10 @@ export default {
           }
 
           if (url.pathname === '/api/user/me' && request.method === 'DELETE') {
-            const { password, code, backup_code } = await request.json() as any;
-            const user = await env.DB.prepare('SELECT password_hash, created_at, totp_secret FROM users WHERE id = ?').bind(userId).first() as any;
+            const body = await request.json() as any;
+            const { password } = body;
+            if (typeof password !== 'string' || password.length > MAX_PASSWORD_LENGTH) return jsonError('INVALID_REQUEST', 'Invalid password', 400);
+            const user = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first() as any;
 
             const dummyHash = '$2a$10$CCCCCCCCCCCCCCCCCCCCC.O0D3I6./CCCCCCCCCCCCCCCCCCCCCCC';
             const passwordHash = user ? user.password_hash : dummyHash;
@@ -1641,26 +1705,19 @@ export default {
 
             if (!user || !passwordValid) return jsonError('INVALID_CREDENTIALS', 'Incorrect password', 401);
 
-            // If TOTP-based 2FA is enabled, require a valid authenticator code
-            // (or a single-use backup code) before destroying the account.
-            if (user.totp_secret) {
-              if (!code && !backup_code) {
-                return jsonError('TWO_FACTOR_REQUIRED', '2FA code required', 400);
-              }
-              const twoFAValid = backup_code
-                ? await verifyAndConsumeBackupCode(env, userId, String(backup_code), jwtSecret)
-                : await consumeTOTP(env, userId, user.totp_secret, String(code));
-              if (!twoFAValid) return jsonError('TWO_FACTOR_INVALID', 'Invalid 2FA code', 400);
+            if (!(await checkRateLimit(env, `sensitive-factor:${userId}`, 10))) return jsonError('RATE_LIMITED', 'Too many attempts', 429);
+            const methods = await factorMethods(env, user);
+            if (methods.length > 0) {
+              if (!body.code && !body.backup_code && !body.passkey) return withSecurityHeaders(new Response(JSON.stringify({
+                code: 'TWO_FACTOR_REQUIRED', message: 'A second factor is required', needs2FA: true, method: methods[0], methods,
+              }), { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } }));
+              if (!(await verifySecondFactor(env, user, body, 'delete', jwtSecret, sessionId))) return jsonError('TWO_FACTOR_INVALID', 'Invalid second factor', 401);
             }
 
-            await env.DB.batch([
-              env.DB.prepare('DELETE FROM dosage_shares WHERE user_id = ?').bind(userId),
-              env.DB.prepare('DELETE FROM content WHERE user_id = ?').bind(userId),
-              env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
-              env.DB.prepare('DELETE FROM passkeys WHERE user_id = ?').bind(userId),
-              env.DB.prepare('DELETE FROM backup_codes WHERE user_id = ?').bind(userId),
-              env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId)
-            ]);
+            const deleted = await env.DB.prepare(`DELETE FROM users WHERE id = ? AND password_hash = ?
+              AND (? IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ?))`)
+              .bind(userId, user.password_hash, sessionId ?? null, sessionId ?? null, userId).run();
+            if (deleted.meta.changes !== 1) return jsonError('INVALID_CREDENTIALS', 'Credentials changed; sign in again', 401);
             try { await env.AVATAR_BUCKET.delete(`hrt-tracker-user-avatar/${userId}`); } catch (e) { }
             await logDeletion(env, 'self', user?.created_at ?? null);
             return withSecurityHeaders(new Response(JSON.stringify({ message: 'Account deleted' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }));

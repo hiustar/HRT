@@ -22,6 +22,48 @@ export interface Session {
     is_current: boolean;
 }
 
+export type FactorMethod = 'totp' | 'passkey';
+export type SecondFactor = { code?: string; backup_code?: string; passkey?: { challengeToken: string; credential: object } };
+export interface PasskeyAuthOptions {
+    challengeToken: string;
+    challenge: string;
+    credentialIds: string[];
+    rpId?: string;
+    userVerification: 'required' | 'preferred';
+}
+
+export function factorMethods(data: { methods?: unknown; method?: unknown }): FactorMethod[] {
+    const methods = Array.isArray(data.methods) ? data.methods : [data.method];
+    return [...new Set(methods.filter((m): m is FactorMethod => m === 'totp' || m === 'passkey'))];
+}
+
+// Keep challenge metadata on errors: apiErrorFrom intentionally only retains code/message.
+async function factorErrorFrom(res: Response): Promise<ApiError> {
+    const data = await res.clone().json().catch(() => ({})) as { needs2FA?: boolean; code?: string; method?: unknown; methods?: unknown };
+    const error = await apiErrorFrom(res);
+    return Object.assign(error, {
+        needs2FA: data.needs2FA === true || data.code === 'TWO_FACTOR_REQUIRED',
+        method: data.method,
+        methods: factorMethods(data),
+    });
+}
+
+export async function getPasskeyAssertion(options: PasskeyAuthOptions, signal?: AbortSignal, direct = false): Promise<NonNullable<SecondFactor['passkey']>> {
+    if (!window.PublicKeyCredential || !navigator.credentials) throw new Error('WebAuthn is not supported');
+    const credential = await navigator.credentials.get({
+        signal,
+        publicKey: {
+            challenge: b64url2ab(options.challenge),
+            rpId: options.rpId ?? window.location.hostname,
+            allowCredentials: options.credentialIds.map(id => ({ type: 'public-key', id: b64url2ab(id) })),
+            userVerification: direct ? 'required' : options.userVerification,
+            timeout: 60000,
+        },
+    }) as PublicKeyCredential | null;
+    if (!credential) throw new DOMException('Verification cancelled', 'NotAllowedError');
+    return { challengeToken: options.challengeToken, credential: serializeAssertionCredential(credential) };
+}
+
 export interface TwoFAStatus {
     enabled: boolean;
     totp?: boolean;
@@ -109,8 +151,8 @@ export function serializeAssertionCredential(credential: PublicKeyCredential): o
 export { b64url2ab };
 
 export const authService = {
-    async login(username: string, password: string, totpCode?: string, backupCode?: string): Promise<AuthResponse> {
-        const body: { username: string; password: string; totp_code?: string; backup_code?: string } = { username, password };
+    async login(username: string, password: string, totpCode?: string, backupCode?: string, passkey?: SecondFactor['passkey']): Promise<AuthResponse> {
+        const body = { username, password, passkey } as { username: string; password: string; totp_code?: string; backup_code?: string; passkey?: SecondFactor['passkey'] };
         if (totpCode) body.totp_code = totpCode;
         if (backupCode) body.backup_code = backupCode;
         const res = await apiFetch('/api/login', {
@@ -118,19 +160,7 @@ export const authService = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
-        if (!res.ok) {
-            const text = await res.text();
-            let data: any;
-            try { data = JSON.parse(text); } catch { /* ignore */ }
-            if (data?.needs2FA) {
-                const err = new Error('2FA_REQUIRED') as any;
-                err.needs2FA = true;
-                err.method = data.method ?? 'totp';
-                throw err;
-            }
-            throw new ApiError(res.status, typeof data?.code === 'string' ? data.code : `HTTP_${res.status}`,
-                typeof data?.message === 'string' ? data.message : text);
-        }
+        if (!res.ok) throw await factorErrorFrom(res);
         return await res.json() as AuthResponse;
     },
 
@@ -157,22 +187,20 @@ export const authService = {
         return await res.json();
     },
 
-    async changePassword(token: string, current: string, newPass: string): Promise<void> {
+    async changePassword(token: string, current: string, newPass: string, factor: SecondFactor = {}): Promise<void> {
         const res = await apiFetch('/api/user/password', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${token}`
             },
-            body: JSON.stringify({ currentPassword: current, newPassword: newPass })
+            body: JSON.stringify({ currentPassword: current, newPassword: newPass, ...factor })
         });
-        if (!res.ok) throw await apiErrorFrom(res);
+        if (!res.ok) throw await factorErrorFrom(res);
     },
 
-    async deleteAccount(token: string, password: string, code?: string, backupCode?: string): Promise<void> {
-        const body: { password: string; code?: string; backup_code?: string } = { password };
-        if (code) body.code = code;
-        if (backupCode) body.backup_code = backupCode;
+    async deleteAccount(token: string, password: string, factor: SecondFactor = {}): Promise<void> {
+        const body = { password, ...factor };
         const res = await apiFetch('/api/user/me', {
             method: 'DELETE',
             headers: {
@@ -181,7 +209,7 @@ export const authService = {
             },
             body: JSON.stringify(body)
         });
-        if (!res.ok) throw await apiErrorFrom(res);
+        if (!res.ok) throw await factorErrorFrom(res);
     },
 
     async listSessions(token: string): Promise<Session[]> {
@@ -319,11 +347,21 @@ export const authService = {
         if (!res.ok) throw await apiErrorFrom(res);
     },
 
-    async passkeyAuthOptions(username?: string): Promise<{ challengeToken: string; challenge: string; credentialIds: string[]; rpId?: string }> {
+    async sensitivePasskeyOptions(token: string, purpose: 'password' | 'delete', password: string): Promise<PasskeyAuthOptions> {
+        const res = await apiFetch('/api/user/passkey/auth-options', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            body: JSON.stringify({ purpose, password }),
+        });
+        if (!res.ok) throw await factorErrorFrom(res);
+        return await res.json();
+    },
+
+    async passkeyAuthOptions(username?: string, password?: string, purpose?: 'login'): Promise<PasskeyAuthOptions> {
         const res = await apiFetch('/api/auth/passkey-options', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(username ? { username } : {}),
+            body: JSON.stringify({ username, password, purpose }),
         });
         if (!res.ok) throw await apiErrorFrom(res);
         return await res.json();

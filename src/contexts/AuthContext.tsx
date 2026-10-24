@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
-import { authService, User, AuthResponse, sessionIdFromToken } from '../services/auth';
+import { authService, User, AuthResponse, sessionIdFromToken, SecondFactor } from '../services/auth';
 import { cacheCloudKey, deriveAndCacheCloudKey } from '../utils/cloudBackup';
 import { UNAUTHORIZED_EVENT } from '../services/apiClient';
 import { useDialog } from './DialogContext';
@@ -8,7 +8,7 @@ import { useTranslation } from './LanguageContext';
 interface AuthContextType {
     user: User | null;
     token: string | null;
-    login: (username: string, password: string, totpCode?: string, backupCode?: string) => Promise<void>;
+    login: (username: string, password: string, totpCode?: string, backupCode?: string, passkey?: SecondFactor['passkey']) => Promise<void>;
     /**
      * Adopt a session issued by something other than the password form — today
      * that is a passkey assertion. `verifiedPassword` is the password the server
@@ -20,8 +20,8 @@ interface AuthContextType {
     logout: () => Promise<void>;
     isLoading: boolean;
     updateProfile: (username: string) => Promise<void>;
-    changePassword: (current: string, newPass: string) => Promise<void>;
-    deleteAccount: (password: string, code?: string, backupCode?: string) => Promise<void>;
+    changePassword: (current: string, newPass: string, factor?: SecondFactor) => Promise<void>;
+    deleteAccount: (password: string, factor?: SecondFactor) => Promise<void>;
     needsSetup2FA: boolean;
     clearSetup2FA: () => void;
 }
@@ -65,8 +65,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsLoading(false);
     }, [token]);
 
-    const login = async (username: string, password: string, totpCode?: string, backupCode?: string) => {
-        const data = await authService.login(username, password, totpCode, backupCode);
+    const login = async (username: string, password: string, totpCode?: string, backupCode?: string, passkey?: SecondFactor['passkey']) => {
+        const data = await authService.login(username, password, totpCode, backupCode, passkey);
         setToken(data.token);
         setUser(data.user);
         localStorage.setItem('auth_token', data.token);
@@ -174,18 +174,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         localStorage.setItem('auth_user', JSON.stringify(updatedUser));
     };
 
-    const changePassword = async (current: string, newPass: string) => {
+    const changePassword = async (current: string, newPass: string, factor?: SecondFactor) => {
         if (!token) return;
-        await authService.changePassword(token, current, newPass);
+        await authService.changePassword(token, current, newPass, factor);
         // Re-derive the cloud key for the new password. Backups made under the
         // old password become unreadable (this is what also stops an admin who
         // resets the password from decrypting them).
         if (user) await deriveAndCacheCloudKey(newPass, user.id);
     };
 
-    const deleteAccount = async (password: string, code?: string, backupCode?: string) => {
+    const deleteAccount = async (password: string, factor?: SecondFactor) => {
         if (!token) return;
-        await authService.deleteAccount(token, password, code, backupCode);
+        await authService.deleteAccount(token, password, factor);
         // The account delete already dropped every sessions row for this user.
         clearLocalSession();
     };

@@ -9,7 +9,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { cloudService, BackupMeta } from '../services/cloud';
 import { readCloudBackup, unlockCloudBackup, normalizeBackupPayload, hasCloudKey, deriveAndCacheCloudKey } from '../utils/cloudBackup';
 import { useDialog } from '../contexts/DialogContext';
-import { authService, serializeAssertionCredential, b64url2ab, sessionIdFromToken } from '../services/auth';
+import { authService, getPasskeyAssertion, sessionIdFromToken } from '../services/auth';
+import TwoFactorVerification, { useTwoFactorVerification } from '../components/TwoFactorVerification';
 import PasswordInputModal from '../components/PasswordInputModal';
 import { describeSyncError, SyncStatus } from '../hooks/useCloudSync';
 import { formatBytes } from '../utils/helpers';
@@ -111,12 +112,7 @@ const Account: React.FC<AccountProps> = ({
     const [password, setPassword] = useState('');
     const [authError, setAuthError] = useState<string | null>(null);
     const [authLoading, setAuthLoading] = useState(false);
-    const [needsTOTP, setNeedsTOTP] = useState(false);
-    const [twoFAMethod, setTwoFAMethod] = useState<'totp' | 'passkey' | null>(null);
-    const [totpCode, setTotpCode] = useState('');
-    const [useBackupCode, setUseBackupCode] = useState(false);
-    const [backupCode, setBackupCode] = useState('');
-    const [passkeyLoading, setPasskeyLoading] = useState(false);
+    const verification = useTwoFactorVerification(JSON.stringify([isLogin, username, password, user?.id]));
     const { login, register, loginWithToken } = useAuth();
 
     // `silent` refreshes the list in place. Sync reports in on its own schedule
@@ -319,84 +315,38 @@ const Account: React.FC<AccountProps> = ({
         };
     };
 
-    const handleAuthSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setAuthError(null);
+    const submitAuth = async (direct = false) => {
+        if (authLoading) return;
         setAuthLoading(true);
-        try {
-            if (isLogin) {
-                await login(
-                    username, password,
-                    needsTOTP && twoFAMethod === 'totp' && !useBackupCode ? totpCode : undefined,
-                    needsTOTP && useBackupCode ? backupCode : undefined,
-                );
-            } else {
-                await register(username, password);
-                return;
-            }
-            setUsername('');
-            setPassword('');
-            setNeedsTOTP(false);
-            setTwoFAMethod(null);
-            setTotpCode('');
-            setUseBackupCode(false);
-            setBackupCode('');
-        } catch (err: any) {
-            if (err.needs2FA) {
-                const method: 'totp' | 'passkey' = err.method ?? 'totp';
-                setNeedsTOTP(true);
-                setTwoFAMethod(method);
-                setAuthError(null);
-                if (method === 'passkey') {
-                    setTimeout(() => handlePasskeyLogin(password), 100);
-                }
-            } else {
-                setAuthError(err.message || t('error.generic'));
-            }
-        } finally {
-            setAuthLoading(false);
-        }
-    };
-
-    // `verifiedPassword` is set only when the passkey is the second factor: the
-    // server has already accepted that password, and passing it on lets the
-    // cloud key be derived from it. A standalone passkey sign-in passes nothing.
-    const handlePasskeyLogin = async (verifiedPassword?: string) => {
-        // Never let anything but a real password through: wired straight to an
-        // onClick this would receive the click event, and a key derived from
-        // that stringified object encrypts uploads no other device can read.
-        const verified = typeof verifiedPassword === 'string' ? verifiedPassword : undefined;
-        if (!window.PublicKeyCredential) {
-            setAuthError(t('auth.passkey_unsupported'));
-            return;
-        }
-        setPasskeyLoading(true);
         setAuthError(null);
         try {
-            const opts = await authService.passkeyAuthOptions(username || undefined);
-            const credential = await navigator.credentials.get({
-                publicKey: {
-                    rpId: opts.rpId ?? window.location.hostname,
-                    challenge: b64url2ab(opts.challenge),
-                    allowCredentials: opts.credentialIds.map(id => ({
-                        type: 'public-key' as const,
-                        id: b64url2ab(id),
-                    })),
-                    timeout: 60000,
-                    userVerification: 'preferred',
-                },
-            }) as PublicKeyCredential | null;
-            if (!credential) return;
-            const result = await authService.passkeyAuthVerify(opts.challengeToken, serializeAssertionCredential(credential));
-            await loginWithToken(result, verified);
+            await verification.run(async (signal, check) => {
+                if (direct) {
+                    const opts = await authService.passkeyAuthOptions(username || undefined);
+                    check();
+                    const assertion = await getPasskeyAssertion(opts, signal, true);
+                    check();
+                    const result = await authService.passkeyAuthVerify(assertion.challengeToken, assertion.credential);
+                    check();
+                    await loginWithToken(result);
+                } else if (isLogin) {
+                    const factor = await verification.resolve(() => authService.passkeyAuthOptions(username, password, 'login'), signal, check);
+                    check();
+                    await login(username, password, factor.code, factor.backup_code, factor.passkey);
+                } else {
+                    check();
+                    await register(username, password);
+                }
+                setUsername('');
+                setPassword('');
+                verification.reset();
+            });
         } catch (e: any) {
-            if (e.name !== 'NotAllowedError') {
-                setAuthError(e.message || t('auth.passkey_failed'));
-            }
-        } finally {
-            setPasskeyLoading(false);
-        }
+            if (e.name === 'AbortError') return;
+            if (!verification.acceptError(e)) setAuthError(e.name === 'NotAllowedError' ? t('auth.factor_cancelled') : e.message || t('error.generic'));
+        } finally { setAuthLoading(false); }
     };
+    const handleAuthSubmit = (e: React.FormEvent) => { e.preventDefault(); void submitAuth(); };
 
     const inputCls = "w-full px-3 py-2.5 text-sm bg-[var(--field)] border border-[var(--border)] rounded-md focus:outline-none focus:border-[var(--accent-ink)] text-[var(--text)]";
 
@@ -775,7 +725,7 @@ const Account: React.FC<AccountProps> = ({
                             { id: 'sign-up', label: t('auth.sign_up') },
                         ]}
                         value={isLogin ? 'sign-in' : 'sign-up'}
-                        onChange={id => { setIsLogin(id === 'sign-in'); setAuthError(null); setNeedsTOTP(false); }}
+                        onChange={id => { if (authLoading) return; verification.reset(); setIsLogin(id === 'sign-in'); setAuthError(null); }}
                         className="mb-5"
                     />
 
@@ -791,7 +741,8 @@ const Account: React.FC<AccountProps> = ({
                             <input
                                 type="text"
                                 value={username}
-                                onChange={(e) => setUsername(e.target.value)}
+                                disabled={authLoading}
+                                onChange={(e) => { verification.reset(); setUsername(e.target.value); setAuthError(null); }}
                                 className={inputCls}
                                 style={{ fontSize: '16px' }}
                                 placeholder={t('auth.username_placeholder')}
@@ -804,7 +755,8 @@ const Account: React.FC<AccountProps> = ({
                             <input
                                 type="password"
                                 value={password}
-                                onChange={(e) => setPassword(e.target.value)}
+                                disabled={authLoading}
+                                onChange={(e) => { verification.reset(); setPassword(e.target.value); setAuthError(null); }}
                                 className={inputCls}
                                 style={{ fontSize: '16px' }}
                                 placeholder={t('auth.password_placeholder')}
@@ -812,94 +764,12 @@ const Account: React.FC<AccountProps> = ({
                                 required
                             />
                         </div>
-                        {needsTOTP && isLogin && (
-                            <div className="space-y-3">
-                                <div className="p-2.5 text-xs text-[var(--text-muted)] bg-[var(--surface-hover)] rounded-md flex items-center gap-2">
-                                    <ShieldIcon size={16} className="shrink-0 text-[var(--accent-ink)]" />
-                                    {t('auth.needs_2fa')}
-                                </div>
-                                {useBackupCode ? (
-                                    <div className="space-y-1.5">
-                    <label className="block text-xs font-semibold text-[var(--text-muted)]">{t('auth.backup_code_label')}</label>
-                                        <input
-                                            type="text"
-                                            value={backupCode}
-                                            onChange={(e) => setBackupCode(e.target.value.toUpperCase())}
-                                            className={`${inputCls} tracking-[0.1em] font-mono text-center`}
-                                            style={{ fontSize: '16px' }}
-                                            placeholder={t('auth.backup_code_placeholder')}
-                                            autoComplete="off"
-                                            autoFocus
-                                            required={useBackupCode}
-                                        />
-                                        <button type="button" onClick={() => { setUseBackupCode(false); setBackupCode(''); }}
-                                            className="text-xs text-[var(--accent-ink)] hover:underline">
-                                            ← {twoFAMethod === 'totp' ? t('auth.totp_code') : t('auth.passkey_as_2fa')}
-                                        </button>
-                                    </div>
-                                ) : (
-                                    <>
-                                        {twoFAMethod !== 'passkey' && (
-                                            <div className="space-y-1.5">
-                        <label className="block text-xs font-semibold text-[var(--text-muted)]">{t('auth.totp_code')}</label>
-                                                <input
-                                                    type="text"
-                                                    inputMode="numeric"
-                                                    pattern="[0-9]{6}"
-                                                    maxLength={6}
-                                                    value={totpCode}
-                                                    onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                                                    className={`${inputCls} tracking-[0.15em] font-mono text-center`}
-                                                    style={{ fontSize: '16px' }}
-                                                    placeholder={t('auth.totp_placeholder')}
-                                                    autoComplete="one-time-code"
-                                                    autoFocus
-                                                    required={needsTOTP && !useBackupCode}
-                                                />
-                                            </div>
-                                        )}
-                                        {twoFAMethod === 'passkey' && typeof window !== 'undefined' && !window.PublicKeyCredential && (
-                                            <p className="text-xs text-[var(--danger)] text-center">{t('auth.passkey_unsupported')}</p>
-                                        )}
-                                        {typeof window !== 'undefined' && !!window.PublicKeyCredential && (
-                                            <>
-                                                {twoFAMethod !== 'passkey' && (
-                                                    <div className="flex items-center gap-2">
-                                                        <div className="flex-1 h-px bg-[var(--border)]" />
-                                                        <span className="text-xs text-[var(--text-muted)]">{t('common.or')}</span>
-                                                        <div className="flex-1 h-px bg-[var(--border)]" />
-                                                    </div>
-                                                )}
-                                                <button
-                                                    type="button"
-                                                    onClick={() => handlePasskeyLogin()}
-                                                    disabled={passkeyLoading}
-                                                    className="w-full py-2.5 text-sm font-medium border border-[var(--border)] rounded-md hover:bg-[var(--surface-hover)] text-[var(--text)] disabled:opacity-50 flex items-center justify-center gap-2"
-                                                >
-                                                    {passkeyLoading ? <Loader2 size={16} className="animate-spin" /> : <Fingerprint size={16} />}
-                                                    {t('auth.passkey_as_2fa')}
-                                                </button>
-                                            </>
-                                        )}
-                                        <button type="button" onClick={() => setUseBackupCode(true)}
-                                            className="w-full text-xs text-[var(--text-muted)] hover:text-[var(--text)] text-center py-1">
-                                            {t('auth.use_backup_code')}
-                                        </button>
-                                    </>
-                                )}
-                            </div>
-                        )}
-                        {!(needsTOTP && twoFAMethod === 'passkey' && !useBackupCode) && (
-                            <button
-                                type="submit"
-                                disabled={authLoading}
-                                className="btn-primary w-full"
-                            >
-                                {authLoading && <Loader2 size={16} className="animate-spin" />}
-                                {isLogin ? t('auth.sign_in') : t('auth.sign_up')}
-                            </button>
-                        )}
-                        {isLogin && !needsTOTP && typeof window !== 'undefined' && !!window.PublicKeyCredential && (
+                        {isLogin && <TwoFactorVerification verification={verification} disabled={authLoading} />}
+                        <button type="submit" disabled={authLoading || !verification.ready} className="btn-primary w-full">
+                            {authLoading && <Loader2 size={16} className="animate-spin" />}
+                            {isLogin ? t('auth.sign_in') : t('auth.sign_up')}
+                        </button>
+                        {isLogin && (
                             <>
                                 <div className="flex items-center gap-2">
                                     <div className="flex-1 h-px bg-[var(--border)]" />
@@ -908,11 +778,11 @@ const Account: React.FC<AccountProps> = ({
                                 </div>
                                 <button
                                     type="button"
-                                    onClick={() => handlePasskeyLogin()}
-                                    disabled={passkeyLoading}
+                                    onClick={() => void submitAuth(true)}
+                                    disabled={authLoading}
                                     className="w-full py-2.5 text-sm font-medium border border-[var(--border)] rounded-md hover:bg-[var(--surface-hover)] text-[var(--text)] disabled:opacity-50 flex items-center justify-center gap-2"
                                 >
-                                    {passkeyLoading ? <Loader2 size={16} className="animate-spin" /> : <Fingerprint size={16} />}
+                                    {authLoading ? <Loader2 size={16} className="animate-spin" /> : <Fingerprint size={16} />}
                                     {t('auth.passkey_login')}
                                 </button>
                             </>
