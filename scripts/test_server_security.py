@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import http.client
 import importlib.util
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 import uuid
 from urllib.parse import quote
@@ -113,7 +115,7 @@ class Authenticator:
                              "userHandle": b64(user_id.encode()) if user_id else None}}
 
 
-class ServerSecurityTests(unittest.TestCase):
+class SecurityHTTPCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="hrt-security-")
@@ -162,7 +164,8 @@ class ServerSecurityTests(unittest.TestCase):
             cls.temp.cleanup()
 
     def setUp(self):
-        # Each test gets its own account; no shared state or execution-order dependency.
+        # Durable buckets are shared by the HTTP server, so isolate every case.
+        self.sql("DELETE FROM auth_rate_limits")
         self.username = "security_" + uuid.uuid4().hex
         result = self.ok("POST", "/api/register",
                          {"username": self.username, "password": PASSWORD})
@@ -227,9 +230,23 @@ class ServerSecurityTests(unittest.TestCase):
     def stored_secret(self):
         return self.sql("SELECT totp_secret FROM users WHERE id = ?", (self.user_id,))[0][0]
 
+    @contextmanager
+    def server_clock(self, timestamp):
+        # Replace the backend's module reference, not the process-wide time module.
+        with patch.object(self.backend, "time", SimpleNamespace(time=lambda: timestamp)):
+            yield
+
+    def advance_totp(self):
+        self.totp_step = max(getattr(self, "totp_step", 0), int(time.time() // 30)) + 1
+        clock = self.server_clock(self.totp_step * 30 + 5)
+        clock.__enter__()
+        self.addCleanup(clock.__exit__, None, None, None)
+        return totp(SECRET, self.totp_step)
+
     def enable(self, secret=SECRET):
         return self.ok("POST", "/api/user/2fa/enable",
-                       {"password": PASSWORD, "secret": secret, "code": totp(secret)}, self.token)
+                       {"password": PASSWORD, "secret": secret,
+                        "code": totp(secret, int(time.time() // 30) - 1)}, self.token)
 
     def crypto(self):
         if not CRYPTO_AVAILABLE:
@@ -392,6 +409,18 @@ class ServerSecurityTests(unittest.TestCase):
 
     def credential_ids(self, options, field="credentialIds"):
         return set(options.get(field, []))
+
+class ServerSecurityTests(SecurityHTTPCase):
+    def setUp(self):
+        # Legacy matrix cases deliberately make many attempts in one case. Keep
+        # real SQLite enforcement, but leave production quotas to dedicated cases.
+        limiter = self.backend.check_auth_rate_limit
+        replacement = patch.object(
+            self.backend, "check_auth_rate_limit",
+            lambda scope, identity, limit, now=None: limiter(scope, identity, 10000, now))
+        replacement.start()
+        self.addCleanup(replacement.stop)
+        super().setUp()
 
     def test_session_registration_and_login_are_valid(self):
         self.alive(self.token)
@@ -1108,7 +1137,7 @@ class ServerSecurityTests(unittest.TestCase):
             self.denied("POST", "/api/login", {"username": self.username, "password": PASSWORD}, origin=new_origin)
             for login_origin in (ORIGIN, new_origin):
                 result = self.ok("POST", "/api/login", {"username": self.username,
-                                 "password": PASSWORD, "totp_code": totp(SECRET)}, origin=login_origin)
+                                 "password": PASSWORD, "totp_code": self.advance_totp()}, origin=login_origin)
                 self.alive(result["token"])
             result = self.ok("POST", "/api/login", {"username": self.username,
                              "password": PASSWORD, "backup_code": codes[0]}, origin=new_origin)
@@ -1119,7 +1148,7 @@ class ServerSecurityTests(unittest.TestCase):
             self.assertTrue(status["totp"])
             self.assertTrue(status["enabled"])
             self.assertFalse(status["passkey"])
-            current, _ = self.enroll({"code": totp(SECRET)}, origin=new_origin, rp_id=new_rp)
+            current, _ = self.enroll({"code": self.advance_totp()}, origin=new_origin, rp_id=new_rp)
             options = self.auth_options(self.username, origin=new_origin)
             result = self.ok("POST", "/api/auth/passkey-verify",
                              self.verify(current, options, origin=new_origin, rp_id=new_rp), origin=new_origin)
@@ -1218,7 +1247,7 @@ class ServerSecurityTests(unittest.TestCase):
             self.assertEqual(self.sql("SELECT rp_id FROM passkeys WHERE id = ?", (pk_id,)), [(RP_ID,)])
             self.alive(self.token)
             self.assertEqual(self.stored_secret(), SECRET)
-            self.alive(self.login(totp_code=totp(SECRET)))
+            self.alive(self.login(totp_code=self.advance_totp()))
 
     def test_direct_passkey_options_require_user_verification(self):
         self.enroll()
@@ -1542,7 +1571,7 @@ class ServerSecurityTests(unittest.TestCase):
         self.enroll()
         self.enable()
         self.factor_ok("password", extra={"code": totp(SECRET)})
-        self.factor_ok("login", password=NEW_PASSWORD, extra={"totp_code": totp(SECRET)})
+        self.factor_ok("login", password=NEW_PASSWORD, extra={"totp_code": self.advance_totp()})
 
     def test_totp_can_replace_passkey_for_sensitive_delete(self):
         self.enroll()
@@ -1598,6 +1627,86 @@ class ServerSecurityTests(unittest.TestCase):
 
     def test_no_factor_account_delete_still_works(self):
         self.factor_ok("delete")
+
+
+class AuthProtectionTests(SecurityHTTPCase):
+    def test_login_and_passkey_options_share_normalized_account_budget(self):
+        for index in range(10):
+            path = '/api/login' if index % 2 == 0 else '/api/auth/passkey-options'
+            status, _, _ = self.request('POST', path, {
+                'username': self.username.upper(), 'password': 'incorrect', 'purpose': 'login'})
+            self.assertEqual(status, 401)
+        status, headers, body = self.request('POST', '/api/login', {
+            'username': self.username, 'password': PASSWORD})
+        self.assertEqual(status, 429, body)
+        self.assertTrue(1 <= int(headers['retry-after']) <= 60)
+        self.assertEqual(body['code'], 'RATE_LIMITED')
+        with self.server_clock(time.time() + 61):
+            self.alive(self.login())
+
+    def test_ip_budget_ignores_untrusted_forwarding_headers(self):
+        for index in range(59):
+            status, _, _ = self.request('POST', '/api/auth/passkey-verify', {},
+                headers={'X-Forwarded-For': f'192.0.2.{index + 1}', 'X-Real-IP': f'192.0.2.{index + 1}'})
+            self.assertEqual(status, 401)
+        status, headers, _ = self.request('POST', '/api/register', {})
+        self.assertEqual(status, 429)
+        self.assertIn('retry-after', headers)
+
+    def test_authenticated_operations_share_user_budget_across_sessions(self):
+        other_token = self.login()
+        paths = ['/api/user/2fa/setup', '/api/user/passkey/register-options']
+        for index in range(10):
+            self.ok('POST', paths[index % 2], {}, self.token if index % 2 else other_token)
+        status, _, _ = self.request('POST', '/api/user/password', {
+            'currentPassword': PASSWORD, 'newPassword': NEW_PASSWORD}, self.token)
+        self.assertEqual(status, 429)
+        self.alive(self.token)
+
+    def test_durable_bucket_is_atomic_and_expires(self):
+        def attempt(_):
+            return self.backend.check_auth_rate_limit('test', self.user_id, 10, now=100)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(attempt, range(24)))
+        self.assertEqual(results.count(0), 10)
+        self.assertEqual(results.count(60), 14)
+        self.assertEqual(self.backend.check_auth_rate_limit('test', self.user_id, 10, now=160), 0)
+
+    def test_proxy_trust_strips_only_trusted_rightmost_hops(self):
+        with patch.object(self.backend, 'TRUSTED_PROXY_CIDRS',
+                          (ipaddress.ip_network('10.0.0.0/8'),)):
+            ip = self.backend.auth_client_ip
+            self.assertEqual(ip('192.0.2.1', '198.51.100.1'), '192.0.2.1')
+            self.assertEqual(ip('10.0.0.1', '198.51.100.1, 192.0.2.1, 10.0.0.2'), '192.0.2.1')
+            self.assertEqual(ip('10.0.0.1', 'invalid, 192.0.2.1'), '10.0.0.1')
+            self.assertEqual(ip('10.0.0.1', '198.51.100.1'), '198.51.100.1')
+
+    def test_enrollment_consumes_setup_step_and_replacement_resets_high_water(self):
+        step = int(time.time() // 30)
+        with self.server_clock(step * 30 + 5):
+            self.ok('POST', '/api/user/2fa/enable', {
+                'password': PASSWORD, 'secret': SECRET, 'code': totp(SECRET, step)}, self.token)
+            self.denied('POST', '/api/login', {
+                'username': self.username, 'password': PASSWORD, 'code': totp(SECRET, step)})
+            self.ok('POST', '/api/user/2fa/enable', {
+                'password': PASSWORD, 'currentCode': totp(SECRET, step + 1),
+                'secret': NEW_SECRET, 'code': totp(NEW_SECRET, step - 1)}, self.token)
+            self.assertEqual(self.sql('SELECT totp_last_step FROM users WHERE id = ?',
+                                     (self.user_id,))[0][0], step - 1)
+            self.alive(self.login(code=totp(NEW_SECRET, step)))
+
+    def test_concurrent_totp_login_has_one_winner(self):
+        self.enable()
+        code = totp(SECRET)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.request('POST', '/api/login', {
+                'username': self.username, 'password': PASSWORD, 'code': code})[0], range(2)))
+        self.assertEqual(sorted(results), [200, 401])
+
+    def test_totp_requires_six_ascii_digits_in_a_string(self):
+        for code in ['１２３４５６', '123456\n', 123456, '12345', '1234567']:
+            with self.subTest(code=code):
+                self.assertIsNone(self.backend.match_totp_step(SECRET, code))
 
 
 if __name__ == "__main__":

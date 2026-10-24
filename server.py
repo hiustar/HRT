@@ -13,6 +13,8 @@ import struct
 import traceback
 import secrets
 import re
+import ipaddress
+import math
 from contextlib import closing
 
 from webauthn import verify_registration_response, verify_authentication_response
@@ -66,6 +68,49 @@ def origin_supports_rp(origin, rp_id):
 
 
 ALLOWED_ORIGINS, RP_ID = load_webauthn_config()
+TRUSTED_PROXY_CIDRS = tuple(ipaddress.ip_network(value.strip()) for value in
+                            os.environ.get('TRUSTED_PROXY_CIDRS', '').split(',') if value.strip())
+
+
+class RateLimitExceeded(Exception):
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__('Too many authentication attempts; try again later')
+
+
+def check_auth_rate_limit(scope, identity, limit, now=None):
+    """Consume a durable bucket slot before opening an action transaction."""
+    now = time.time() if now is None else now
+    key = hashlib.sha256((scope + '\0' + identity).encode('utf-8')).hexdigest()
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('DELETE FROM auth_rate_limits WHERE window_start + 60 <= ?', (now,))
+        row = conn.execute('SELECT window_start, count FROM auth_rate_limits WHERE key = ?', (key,)).fetchone()
+        if row and row[1] >= limit:
+            return max(1, math.ceil(row[0] + 60 - now))
+        if row:
+            conn.execute('UPDATE auth_rate_limits SET count = count + 1 WHERE key = ?', (key,))
+        else:
+            conn.execute('INSERT INTO auth_rate_limits (key, window_start, count) VALUES (?, ?, 1)', (key, now))
+    return 0
+
+
+def auth_client_ip(peer, forwarded_for=None):
+    """Ignore forwarding headers unless the socket peer is an explicitly trusted proxy."""
+    address = ipaddress.ip_address(peer)
+    trusted = lambda ip: any(ip in network for network in TRUSTED_PROXY_CIDRS)
+    if not trusted(address) or not forwarded_for:
+        return str(address)
+    try:
+        chain = [ipaddress.ip_address(part.strip()) for part in forwarded_for.split(',')]
+    except ValueError:
+        return str(address)
+    for hop in reversed(chain):
+        if not trusted(address):
+            break
+        address = hop
+    return str(address)
+
 
 # --- 数据库初始化与自动结构热升级 ---
 def init_db():
@@ -95,6 +140,11 @@ def init_db():
             except Exception:
                 pass
 
+    if 'totp_last_step' not in existing_cols:
+        c.execute('ALTER TABLE users ADD COLUMN totp_last_step INTEGER')
+    c.execute('''CREATE TABLE IF NOT EXISTS auth_rate_limits (
+        key TEXT PRIMARY KEY, window_start REAL NOT NULL, count INTEGER NOT NULL
+    )''')
     c.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             token TEXT PRIMARY KEY,
@@ -266,24 +316,46 @@ def verify_passkey(conn, proof, purpose, origin, user_id=None, session_id=None):
 def generate_totp_secret() -> str:
     return base64.b32encode(os.urandom(20)).decode('ascii').rstrip('=')
 
-def verify_totp(secret: str, code: str) -> bool:
-    if not secret or not code:
-        return False
+def match_totp_step(secret: str, code: str, now=None):
+    """Return the matching step, or None; codes must be exactly six ASCII digits."""
+    if not secret or not isinstance(code, str) or not re.fullmatch(r'[0-9]{6}', code):
+        return None
     try:
         secret_clean = secret.replace(' ', '').upper()
         pad = (8 - len(secret_clean) % 8) % 8
         key = base64.b32decode((secret_clean + '=' * pad).encode('ascii'))
-        current_step = int(time.time() // 30)
-        for step in [current_step, current_step - 1, current_step + 1]:
+        current_step = int((time.time() if now is None else now) // 30)
+        matched = None
+        for step in [current_step - 1, current_step, current_step + 1]:
+            if step < 0:
+                continue
             msg = struct.pack('>Q', step)
             h = hmac.new(key, msg, hashlib.sha1).digest()
             o = h[19] & 15
             token = (struct.unpack('>I', h[o:o+4])[0] & 0x7fffffff) % 1000000
-            if f'{token:06d}' == str(code).strip():
-                return True
+            if hmac.compare_digest(f'{token:06d}', code):
+                matched = step
+        return matched
+    except (ValueError, TypeError, UnicodeError):
+        return None
+
+
+def totp_key_identity(secret):
+    clean = secret.replace(' ', '').upper().rstrip('=')
+    key = base64.b32decode(clean + '=' * (-len(clean) % 8))
+    return (hashlib.sha1(key).digest() if len(key) > 64 else key).ljust(64, b'\0')
+
+
+def consume_totp(conn, user, secret, code):
+    """Atomically consume a step inside the caller's BEGIN IMMEDIATE transaction."""
+    step = match_totp_step(secret, code)
+    if step is None:
         return False
-    except Exception:
-        return False
+    return conn.execute('''UPDATE users SET totp_last_step = ?
+        WHERE id = ? AND totp_secret = ?
+        AND (totp_last_step IS NULL OR totp_last_step < ?)''',
+                        (step, user, secret, step)).rowcount == 1
+
 
 def generate_backup_codes() -> list:
     return [hashlib.md5(os.urandom(16)).hexdigest()[:8].upper() for _ in range(8)]
@@ -305,6 +377,10 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.send_cors()
         self.send_header('Cache-Control', 'no-store')
+        if status == 429:
+            self.send_header('Retry-After', str(self._retry_after))
+            self.send_header('Access-Control-Expose-Headers', 'Retry-After')
+            self.close_connection = True
         if status == 401 and data.get('code') == 'UNAUTHORIZED':
             self.send_header('X-Session-Invalid', '1')
             self.send_header('Access-Control-Expose-Headers', 'X-Session-Invalid')
@@ -322,11 +398,34 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
         self.send_cors()
         self.end_headers()
 
+    def auth_rate_limit(self, scope, identity, limit):
+        retry = check_auth_rate_limit(scope, identity, limit)
+        if retry:
+            raise RateLimitExceeded(retry)
+
+    def limit_auth_ip(self):
+        forwarded = ','.join(self.headers.get_all('X-Forwarded-For', []))
+        self.auth_rate_limit('ip', auth_client_ip(self.client_address[0], forwarded), 60)
+
     def get_token_user(self):
         auth_header = self.headers.get('Authorization', '')
         if auth_header.startswith('Bearer '):
             token = auth_header[7:].strip()
-            return verify_token(token)
+            user = verify_token(token)
+            path = urllib.parse.urlparse(self.path).path
+            protected_checks = {
+                '/api/user/password', '/api/user/2fa/enable', '/api/user/2fa',
+                '/api/user/2fa/backup-codes/generate', '/api/user/passkey/register',
+                '/api/user/passkey/auth-options', '/api/user/passkey/register-options',
+                '/api/user/2fa/setup',
+            }
+            if user and ((self.command == 'POST' and path in protected_checks)
+                         or (self.command == 'DELETE' and
+                             (path in ('/api/user/me', '/api/user/2fa') or path.startswith('/api/user/passkeys/')))):
+                # Charge once, after token verification and before any action transaction.
+                self.limit_auth_ip()
+                self.auth_rate_limit('user', user['user_id'], 10)
+            return user
         return None
 
     def read_json_body(self):
@@ -375,7 +474,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 or not hmac.compare_digest(hash_password(password, row[1]), row[0])):
             self.send_error_json(401, 'INVALID_CREDENTIALS', 'Current password is required and must be correct')
             return False
-        if require_totp and row[2] and not verify_totp(row[2], data.get(code_field) or ''):
+        if require_totp and row[2] and not consume_totp(conn, user_id, row[2], data.get(code_field) or ''):
             self.send_error_json(401, 'TWO_FACTOR_INVALID', 'Current authenticator code is required')
             return False
         return True
@@ -389,7 +488,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
             conn.execute('BEGIN IMMEDIATE')
             if not self.require_password(conn, auth_user['user_id'], data, require_totp=True):
                 return
-            conn.execute('UPDATE users SET totp_secret = NULL, backup_codes = NULL WHERE id = ?', (auth_user['user_id'],))
+            conn.execute('UPDATE users SET totp_secret = NULL, backup_codes = NULL, totp_last_step = NULL WHERE id = ?', (auth_user['user_id'],))
         return self.send_json({'success': True})
 
     def factor_methods(self, conn, user_id):
@@ -431,7 +530,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 return True
         elif code and 'totp' in methods:
             secret = conn.execute('SELECT totp_secret FROM users WHERE id = ?', (user_id,)).fetchone()[0]
-            if verify_totp(secret, str(code)):
+            if consume_totp(conn, user_id, secret, code):
                 return True
         if not code and not backup:
             self.send_error_json(401, 'TWO_FACTOR_REQUIRED', 'A second factor is required',
@@ -441,6 +540,9 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
         return False
 
     def passkey_auth_options(self, username, password=None, purpose='authenticate', auth_user=None):
+        username = username.strip().lower()
+        if purpose == 'login':
+            self.auth_rate_limit('account', username, 10)
         origin = self.check_webauthn_origin()
         if not origin:
             return
@@ -472,6 +574,9 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
         try:
             url = urllib.parse.urlparse(self.path)
             path = url.path
+
+            if path in ('/api/login', '/api/register', '/api/auth/passkey-options', '/api/auth/passkey-verify'):
+                self.limit_auth_ip()
 
             # 2FA 密钥申请: POST /api/user/2fa/setup
             if path == '/api/user/2fa/setup':
@@ -614,7 +719,8 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
             # 2. 登录: POST /api/login
             if path == '/api/login':
                 data = self.read_json_body()
-                username = (data.get('username') or '').strip()
+                username = (data.get('username') or '').strip().lower()
+                self.auth_rate_limit('account', username, 10)
                 password = data.get('password') or ''
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
@@ -688,15 +794,25 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 secret = data.get('secret') or ''
                 code = data.get('code') or ''
 
+                # Validate the replacement before consuming the old authenticator code.
+                if not isinstance(secret, str) or not re.fullmatch(r'[A-Z2-7]{16,64}', secret, re.IGNORECASE):
+                    return self.send_error_json(400, 'INVALID_CODE', '验证码不匹配，请核对手机时间与输入')
+                secret = secret.upper()
+                step = match_totp_step(secret, code)
+                if step is None:
+                    return self.send_error_json(400, 'INVALID_CODE', '验证码不匹配，请核对手机时间与输入')
                 with closing(sqlite3.connect(DB_PATH)) as conn, conn:
                     conn.execute('BEGIN IMMEDIATE')
                     if not self.require_password(conn, auth_user['user_id'], data, require_totp=True, code_field='currentCode'):
                         return
-                    if not re.fullmatch(r'[A-Z2-7]{16,64}', secret, re.IGNORECASE) or not verify_totp(secret, code):
-                        return self.send_error_json(400, 'INVALID_CODE', '验证码不匹配，请核对手机时间与输入')
+                    old = conn.execute('SELECT totp_secret, totp_last_step FROM users WHERE id = ?',
+                                       (auth_user['user_id'],)).fetchone()
+                    # Re-saving the same secret must never lower its replay high-water mark.
+                    if old[0] and hmac.compare_digest(totp_key_identity(old[0]), totp_key_identity(secret)) and old[1] is not None:
+                        step = max(step, old[1])
                     codes = generate_backup_codes()
-                    conn.execute('UPDATE users SET totp_secret = ?, backup_codes = ? WHERE id = ?',
-                                 (secret, json.dumps(codes), auth_user['user_id']))
+                    conn.execute('UPDATE users SET totp_secret = ?, backup_codes = ?, totp_last_step = ? WHERE id = ?',
+                                 (secret, json.dumps(codes), step, auth_user['user_id']))
                 return self.send_json({"backupCodes": codes})
 
             # 5. 关闭 2FA: POST /api/user/2fa
@@ -744,6 +860,9 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 return self.send_json({"id": bk_id})
 
             return self.send_error_json(404, 'NOT_FOUND', 'Not Found')
+        except RateLimitExceeded as e:
+            self._retry_after = e.retry_after
+            return self.send_error_json(429, 'RATE_LIMITED', str(e))
         except Exception as e:
             traceback.print_exc()
             return self.send_error_json(500, 'INTERNAL_SERVER_ERROR', str(e))
@@ -834,6 +953,7 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
 
             # 通行密钥免密登录选项: GET /api/auth/passkey-options
             if path == '/api/auth/passkey-options':
+                self.limit_auth_ip()
                 query = urllib.parse.parse_qs(url.query)
                 return self.passkey_auth_options((query.get('username', [''])[0]).strip())
 
@@ -874,6 +994,9 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
             if not os.path.exists(req_path) or os.path.isdir(req_path):
                 self.path = '/index.html'
             return super().do_GET()
+        except RateLimitExceeded as e:
+            self._retry_after = e.retry_after
+            return self.send_error_json(429, 'RATE_LIMITED', str(e))
         except Exception as e:
             traceback.print_exc()
             return self.send_error_json(500, 'INTERNAL_SERVER_ERROR', str(e))
@@ -967,6 +1090,9 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 return self.send_json({"success": True})
 
             return self.send_error_json(404, 'NOT_FOUND', 'Not Found')
+        except RateLimitExceeded as e:
+            self._retry_after = e.retry_after
+            return self.send_error_json(429, 'RATE_LIMITED', str(e))
         except Exception as e:
             traceback.print_exc()
             return self.send_error_json(500, 'INTERNAL_SERVER_ERROR', str(e))

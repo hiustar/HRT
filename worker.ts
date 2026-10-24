@@ -33,9 +33,8 @@ export interface Env {
 // switched itself off.
 //
 // Every caller asks for some requests-per-minute ceiling; the binding whose
-// class matches is used. A missing binding is a configuration hole, not a
-// runtime condition, and it fails OPEN so a mis-deployed self-hosted instance
-// still serves — it is logged once per isolate so it can't stay quiet.
+// class matches is used. Non-auth traffic retains fail-open availability;
+// authentication must fail closed with a 503 if its limiter is unavailable.
 const RATE_LIMIT_CLASSES: Record<number, keyof Env> = {
   10: 'RL_PER_MINUTE_10',
   20: 'RL_PER_MINUTE_20',
@@ -46,10 +45,17 @@ const RATE_LIMIT_CLASSES: Record<number, keyof Env> = {
 const missingLimiterReported = new Set<string>();
 
 /** True when the caller is within `perMinute` requests a minute for `key`. */
-async function checkRateLimit(env: Env, key: string, perMinute: number): Promise<boolean> {
+class AuthLimiterUnavailable extends Error {}
+
+async function checkAuthRateLimit(env: Env, key: string, perMinute = 10): Promise<boolean> {
+  return checkRateLimit(env, key, perMinute, true);
+}
+
+async function checkRateLimit(env: Env, key: string, perMinute: number, strict = false): Promise<boolean> {
   const bindingName = RATE_LIMIT_CLASSES[perMinute];
   const limiter = bindingName ? (env[bindingName] as RateLimit | undefined) : undefined;
   if (!limiter) {
+    if (strict) throw new AuthLimiterUnavailable('Authentication limiter missing');
     const what = bindingName ?? `no class for ${perMinute}/min`;
     if (!missingLimiterReported.has(what)) {
       missingLimiterReported.add(what);
@@ -59,12 +65,11 @@ async function checkRateLimit(env: Env, key: string, perMinute: number): Promise
   }
   try {
     const { success } = await limiter.limit({ key });
+    if (typeof success !== 'boolean') throw new Error('Invalid limiter result');
     return success;
   } catch (e) {
-    // The binding itself erroring is an infrastructure fault. Failing open
-    // here is a deliberate choice: the alternative locks every user out over
-    // an outage in a component that isn't the database.
     console.error('Rate limit check failed:', e);
+    if (strict) throw new AuthLimiterUnavailable('Authentication limiter unavailable');
     return true;
   }
 }
@@ -379,13 +384,9 @@ async function hotp(secret: string, counter: number): Promise<string> {
   return (code % 1_000_000).toString().padStart(6, '0');
 }
 
-async function verifyTOTP(secret: string, token: string, windowSize = 1): Promise<boolean> {
-  return (await matchTOTPStep(secret, token, windowSize)) !== null;
-}
-
 /** The 30-second step a code matches, or null. Needed so it can be consumed. */
 async function matchTOTPStep(secret: string, token: string, windowSize = 1): Promise<number | null> {
-  if (!/^\d{6}$/.test(token)) return null;
+  if (typeof token !== 'string' || token.length !== 6 || !/^[0-9]{6}$/.test(token)) return null;
   const T = Math.floor(Date.now() / 1000 / 30);
   for (let i = -windowSize; i <= windowSize; i++) {
     if (await hotp(secret, T + i) === token) return T + i;
@@ -400,6 +401,14 @@ async function matchTOTPStep(secret: string, token: string, windowSize = 1): Pro
  * it. RFC 6238 §5.2 requires one-time acceptance. Backup codes already did this
  * via their used_at column — this brings TOTP in line.
  */
+function sameTOTPKey(first: string, second: string): boolean {
+  // SHA-1 HMAC zero-pads these sub-64-byte keys, so trailing zeros do not create a new key.
+  const a = base32Decode(first), b = base32Decode(second);
+  let difference = 0;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) difference |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return difference === 0;
+}
+
 async function consumeTOTP(env: Env, userId: string, secret: string, token: string): Promise<boolean> {
   const step = await matchTOTPStep(secret, token);
   if (step === null) return false;
@@ -409,8 +418,8 @@ async function consumeTOTP(env: Env, userId: string, secret: string, token: stri
   // old totp_last_step and both succeeded — precisely the replay the function
   // exists to prevent.
   const res = await env.DB.prepare(
-    'UPDATE users SET totp_last_step = ? WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)'
-  ).bind(step, userId, step).run();
+    'UPDATE users SET totp_last_step = ? WHERE id = ? AND totp_secret = ? AND (totp_last_step IS NULL OR totp_last_step < ?)'
+  ).bind(step, userId, secret, step).run();
   return (res.meta?.changes ?? 0) > 0;
 }
 
@@ -868,8 +877,16 @@ export default {
       }
 
       // Rate limiting for auth/sensitive endpoints
-      const sensitivePaths = ['/api/login', '/api/register', '/api/user/password', '/api/user/me'];
-      if (sensitivePaths.some(p => url.pathname === p)) {
+      // One shared account budget for every authenticated password/factor recheck.
+      const sensitiveAccountPath =
+        (request.method === 'POST' && [
+          '/api/user/password', '/api/user/passkey/auth-options',
+          '/api/user/passkey/register', '/api/user/passkey/register-options',
+          '/api/user/2fa/setup', '/api/user/2fa/enable', '/api/user/2fa/backup-codes/generate',
+        ].includes(url.pathname)) ||
+        (request.method === 'DELETE' && (['/api/user/me', '/api/user/2fa'].includes(url.pathname) ||
+          /^\/api\/user\/passkeys\/[^/]+$/.test(url.pathname)));
+      if (sensitiveAccountPath || (request.method === 'POST' && ['/api/login', '/api/register'].includes(url.pathname))) {
         // CF-Connecting-IP only. X-Forwarded-For / X-Real-IP were a fallback here,
         // but behind the Cloudflare edge they are never reached (CF always sets
         // CF-Connecting-IP), and anywhere else they are attacker-controlled — one
@@ -879,7 +896,7 @@ export default {
         // self-hosted build still serves; the per-account limiter in the login
         // handler is what actually bounds brute force there.
         const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-        if (!(await checkRateLimit(env, clientIP, 10))) { // Slightly relaxed but broader coverage
+        if (!(await checkAuthRateLimit(env, `auth-ip:${clientIP}`, 10))) { // Slightly relaxed but broader coverage
           return jsonError('RATE_LIMITED', 'Too many requests. Please try again later.', 429, { 'Retry-After': '60' });
         }
       }
@@ -1031,7 +1048,7 @@ export default {
         // against a single account no matter how many identities the caller
         // presents, which is the case that matters on a self-hosted deployment
         // with no trusted edge in front of it. Covers the admin branch too.
-        if (!(await checkRateLimit(env, `login-user:${username.toLowerCase()}`, 10))) {
+        if (!(await checkAuthRateLimit(env, `login-user:${username.toLowerCase()}`, 10))) {
           return jsonError('RATE_LIMITED', 'Too many attempts for this account. Please try again later.', 429, { 'Retry-After': '60' });
         }
 
@@ -1117,14 +1134,14 @@ export default {
       // POST /api/auth/passkey-options — generate WebAuthn auth challenge (public, no JWT)
       if (url.pathname === '/api/auth/passkey-options' && request.method === 'POST') {
         const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-        if (!(await checkRateLimit(env, `passkey-options:${clientIP}`, 10))) {
+        if (!(await checkAuthRateLimit(env, `passkey-options:${clientIP}`, 10))) {
           return jsonError('RATE_LIMITED', 'Too many requests', 429, { 'Retry-After': '60' });
         }
         const { username, password, purpose } = (await request.json().catch(() => ({}))) as any;
         if (purpose !== undefined && purpose !== 'login') return jsonError('INVALID_REQUEST', 'Invalid purpose', 400);
         if (username !== undefined && typeof username !== 'string') return jsonError('INVALID_REQUEST', 'Invalid username', 400);
         const name = typeof username === 'string' ? username.trim() : '';
-        if (name && !(await checkRateLimit(env, `login-user:${name.toLowerCase()}`, 10))) {
+        if (name && !(await checkAuthRateLimit(env, `login-user:${name.toLowerCase()}`, 10))) {
           return jsonError('RATE_LIMITED', 'Too many attempts for this account', 429, { 'Retry-After': '60' });
         }
         let user = name ? await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(name).first() as any : null;
@@ -1143,7 +1160,7 @@ export default {
       // POST /api/auth/passkey-verify — verify WebAuthn assertion and issue session JWT (public)
       if (url.pathname === '/api/auth/passkey-verify' && request.method === 'POST') {
         const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-        if (!(await checkRateLimit(env, `passkey-verify:${clientIP}`, 10))) {
+        if (!(await checkAuthRateLimit(env, `passkey-verify:${clientIP}`, 10))) {
           return jsonError('RATE_LIMITED', 'Too many requests', 429, { 'Retry-After': '60' });
         }
         const { challengeToken, credential } = await request.json() as any;
@@ -1348,6 +1365,10 @@ export default {
           if (nowTs - lastUsed > 300) {
             ctx.waitUntil(env.DB.prepare('UPDATE sessions SET last_used_at = ? WHERE id = ?').bind(nowTs, sessionId).run());
           }
+        }
+
+        if (sensitiveAccountPath && !(await checkAuthRateLimit(env, `sensitive-user:${userId}`, 10))) {
+          return jsonError('RATE_LIMITED', 'Too many attempts for this account', 429, { 'Retry-After': '60' });
         }
 
         // --- Dosage sharing (owner management) ---
@@ -1625,11 +1646,6 @@ export default {
 
         // A password-bound passkey proof is usable only by this session and operation.
         if (url.pathname === '/api/user/passkey/auth-options' && request.method === 'POST') {
-          const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-          if (!(await checkRateLimit(env, `passkey-sensitive-ip:${ip}`, 10)) ||
-              !(await checkRateLimit(env, `passkey-sensitive-user:${userId}`, 10))) {
-            return jsonError('RATE_LIMITED', 'Too many attempts', 429, { 'Retry-After': '60' });
-          }
           const { purpose, password } = await request.json() as any;
           if ((purpose !== 'password' && purpose !== 'delete') || typeof password !== 'string' || password.length > MAX_PASSWORD_LENGTH) {
             return jsonError('INVALID_REQUEST', 'Invalid purpose or password', 400);
@@ -1669,7 +1685,6 @@ export default {
 
             const passVal = validatePassword(newPassword);
             if (!passVal.valid) return jsonError('INVALID_REQUEST', passVal.error!, 400);
-            if (!(await checkRateLimit(env, `sensitive-factor:${userId}`, 10))) return jsonError('RATE_LIMITED', 'Too many attempts', 429);
             const methods = await factorMethods(env, user);
             if (methods.length > 0) {
               if (!body.code && !body.backup_code && !body.passkey) return withSecurityHeaders(new Response(JSON.stringify({
@@ -1705,7 +1720,6 @@ export default {
 
             if (!user || !passwordValid) return jsonError('INVALID_CREDENTIALS', 'Incorrect password', 401);
 
-            if (!(await checkRateLimit(env, `sensitive-factor:${userId}`, 10))) return jsonError('RATE_LIMITED', 'Too many attempts', 429);
             const methods = await factorMethods(env, user);
             if (methods.length > 0) {
               if (!body.code && !body.backup_code && !body.passkey) return withSecurityHeaders(new Response(JSON.stringify({
@@ -2134,9 +2148,12 @@ export default {
           // POST /api/user/2fa/enable — verify code and save secret to DB
           if (url.pathname === '/api/user/2fa/enable' && request.method === 'POST') {
             const { secret: totpSecret, code, password, currentCode } = await request.json() as any;
-            if (!totpSecret || !code) return jsonError('INVALID_REQUEST', 'Missing secret or code', 400);
-            // Validate secret format (base32 chars, 16-32 chars)
+            if (typeof totpSecret !== 'string' || !code) return jsonError('INVALID_REQUEST', 'Missing secret or code', 400);
+            // Canonicalize so lowercase re-enrolment cannot disguise the same key.
             if (!/^[A-Z2-7]{16,64}$/i.test(totpSecret)) return jsonError('INVALID_REQUEST', 'Invalid secret format', 400);
+            const canonicalSecret = base32Encode(base32Decode(totpSecret));
+            const matchedStep = await matchTOTPStep(canonicalSecret, code);
+            if (matchedStep === null) return jsonError('TWO_FACTOR_INVALID', 'Invalid 2FA code', 400);
 
             const existing = await env.DB.prepare('SELECT password_hash, totp_secret FROM users WHERE id = ?').bind(userId).first() as any;
             if (!existing) return jsonError('NOT_FOUND', 'User not found', 404);
@@ -2169,13 +2186,23 @@ export default {
               if (!currentCode) {
                 return jsonError('INVALID_REQUEST', '2FA is already enabled: current password and a code from the current authenticator are required', 400);
               }
-              const currentValid = await consumeTOTP(env, userId, existing.totp_secret, String(currentCode));
+              const currentValid = await consumeTOTP(env, userId, existing.totp_secret, currentCode);
               if (!currentValid) return jsonError('TWO_FACTOR_INVALID', 'Invalid code from current authenticator', 401);
             }
 
-            const valid = await verifyTOTP(totpSecret, String(code));
-            if (!valid) return jsonError('TWO_FACTOR_INVALID', 'Invalid 2FA code', 400);
-            await env.DB.prepare('UPDATE users SET totp_secret = ? WHERE id = ?').bind(totpSecret, userId).run();
+            const sameSecret = existing.totp_secret &&
+              sameTOTPKey(existing.totp_secret, canonicalSecret);
+            if (sameSecret && code !== currentCode && !(await consumeTOTP(env, userId, existing.totp_secret, code))) {
+              return jsonError('TWO_FACTOR_INVALID', 'Invalid or consumed 2FA code', 400);
+            }
+            // Compare-and-swap the expected secret; a concurrent replacement must
+            // not authorize this write. Same-key enrolment never lowers high water.
+            const updated = await env.DB.prepare(`UPDATE users SET totp_secret = ?,
+              totp_last_step = CASE WHEN ? AND totp_last_step > ? THEN totp_last_step ELSE ? END
+              WHERE id = ? AND totp_secret IS ? AND password_hash = ?`)
+              .bind(canonicalSecret, sameSecret ? 1 : 0, matchedStep, matchedStep,
+                userId, existing.totp_secret, existing.password_hash).run();
+            if (updated.meta.changes !== 1) return jsonError('TWO_FACTOR_INVALID', 'Authenticator changed; try again', 401);
             const backupCodes = await generateAndStoreBackupCodes(env, userId, jwtSecret);
             return withSecurityHeaders(new Response(JSON.stringify({ message: '2FA enabled', backupCodes }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }));
           }
@@ -2190,9 +2217,11 @@ export default {
             const passValid = await bcrypt.compare(password, userRow.password_hash ?? dummyHash);
             if (!passValid) return jsonError('INVALID_CREDENTIALS', 'Incorrect password', 401);
             if (!userRow.totp_secret) return jsonError('INVALID_REQUEST', '2FA is not enabled', 400);
-            const totpValid = await consumeTOTP(env, userId, userRow.totp_secret, String(code));
+            const totpValid = await consumeTOTP(env, userId, userRow.totp_secret, code);
             if (!totpValid) return jsonError('TWO_FACTOR_INVALID', 'Invalid 2FA code', 400);
-            await env.DB.prepare('UPDATE users SET totp_secret = NULL WHERE id = ?').bind(userId).run();
+            const cleared = await env.DB.prepare('UPDATE users SET totp_secret = NULL, totp_last_step = NULL WHERE id = ? AND totp_secret = ?')
+              .bind(userId, userRow.totp_secret).run();
+            if (cleared.meta.changes !== 1) return jsonError('TWO_FACTOR_INVALID', 'Authenticator changed; try again', 401);
             return withSecurityHeaders(new Response(JSON.stringify({ message: '2FA disabled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }));
           }
 
@@ -2375,6 +2404,9 @@ export default {
       }
 
     } catch (err: any) {
+      if (err instanceof AuthLimiterUnavailable) {
+        return jsonError('SERVICE_UNAVAILABLE', 'Authentication protection temporarily unavailable', 503);
+      }
       console.error('API Error:', err);
       // The one infrastructure failure worth naming to the client: a database
       // at its size cap fails every insert that needs the file to grow, while

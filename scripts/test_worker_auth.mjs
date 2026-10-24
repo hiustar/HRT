@@ -32,15 +32,19 @@ class D1 {
   }
   prepare(sql) {
     const sqlite = this.sqlite;
+    // node:sqlite does not bind D1's numbered placeholders positionally.
+    const indexes = [];
+    const normalizedSQL = sql.replace(/\?(\d+)/g, (_, index) => { indexes.push(Number(index) - 1); return '?'; });
+    const argsFor = values => indexes.length ? indexes.map(index => values[index]) : values;
     const make = values => ({
       bind: (...args) => make(args),
       first: async column => {
-        const row = sqlite.prepare(sql).get(...values);
+        const row = sqlite.prepare(normalizedSQL).get(...argsFor(values));
         return row ? (column === undefined ? { ...row } : row[column]) : null;
       },
-      all: async () => ({ success: true, results: sqlite.prepare(sql).all(...values).map(row => ({ ...row })) }),
+      all: async () => ({ success: true, results: sqlite.prepare(normalizedSQL).all(...argsFor(values)).map(row => ({ ...row })) }),
       run: async () => {
-        const result = sqlite.prepare(sql).run(...values);
+        const result = sqlite.prepare(normalizedSQL).run(...argsFor(values));
         return { success: true, results: [], meta: { changes: Number(result.changes), last_row_id: Number(result.lastInsertRowid) } };
       },
     });
@@ -80,6 +84,17 @@ function expect(response, status = 200, code) {
   return response.body;
 }
 
+// Deterministic fixed-window stand-in for the edge binding (not crypto).
+class LocalLimiter {
+  buckets = new Map();
+  async limit({ key }) {
+    const window = Math.floor(Date.now() / 60000);
+    const previous = this.buckets.get(key);
+    const count = previous?.window === window ? previous.count + 1 : 1;
+    this.buckets.set(key, { window, count });
+    return { success: count <= 10 };
+  }
+}
 let worker;
 async function fixture() {
   const db = new D1();
@@ -92,10 +107,14 @@ async function fixture() {
   };
   for (const limit of [10, 20, 30, 60, 300]) env[`RL_PER_MINUTE_${limit}`] = { limit: async () => ({ success: true }) };
   const ctx = { waitUntil: promise => pending.push(promise) };
-  async function api(path, body, token, method = 'POST') {
+  async function api(path, body, token, method = 'POST', extraHeaders = {}) {
+    const headers = new Headers({ Origin: origin, 'Content-Type': 'application/json', 'CF-Connecting-IP': '192.0.2.1',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}) });
+    for (const [key, value] of Object.entries(extraHeaders)) {
+      if (value === null) headers.delete(key); else headers.set(key, value);
+    }
     const response = await worker.fetch(new Request(`${origin}${path}`, {
-      method, headers: { Origin: origin, 'Content-Type': 'application/json', 'CF-Connecting-IP': '192.0.2.1',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      method, headers,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }), env, ctx);
     const text = await response.text();
@@ -156,7 +175,7 @@ async function fixture() {
     if (purpose === 'password') return api('/api/user/password', { currentPassword: password, newPassword, passkey, ...overrides }, token);
     return api('/api/user/me', { password, passkey, ...overrides }, token, 'DELETE');
   }
-  return { db, api, user, options, proof, submit, deletedAvatars,
+  return { db, env, api, user, options, proof, submit, deletedAvatars,
     close: async () => { try { await Promise.all(pending); } finally { db.close(); } } };
 }
 
@@ -436,6 +455,174 @@ for (const purpose of ['password', 'delete']) {
   });
 }
 
+const stepNow = () => Math.floor(Date.now() / 30000);
+async function enroll(f, u, bytes, step = stepNow() - 1, extra = {}) {
+  return f.api('/api/user/2fa/enable', { secret: base32(bytes), code: totp(bytes, step), password, ...extra }, u.token);
+}
+for (const delta of [-1, 0, 1]) {
+  test(`TOTP enrollment consumes setup step ${delta} and rejects login replay`, async f => {
+    const u = await f.user();
+    const bytes = randomBytes(20);
+    expect(await enroll(f, u, bytes, stepNow() + delta));
+    const code = totp(bytes, stepNow() + delta);
+    expect(await f.api('/api/login', { username: u.username, password, code }), 401, 'TWO_FACTOR_INVALID');
+    assert.equal((await f.db.prepare('SELECT totp_last_step FROM users WHERE id = ?').bind(u.id).first()).totp_last_step, stepNow() + delta);
+    if (delta === -1) expect(await f.api('/api/login', { username: u.username, password, code: totp(bytes) }));
+  });
+}
+test('TOTP concurrent consumption issues exactly one session', async f => {
+  const u = await f.user({ otp: true });
+  const responses = await Promise.all(Array.from({ length: 3 }, () => f.api('/api/login', { username: u.username, password, code: totp(u.otpBytes) })));
+  assert.deepEqual(responses.map(r => r.status).sort(), [200, 401, 401]);
+});
+test('TOTP same-secret reenrollment cannot resurrect a consumed setup code or lower high water', async f => {
+  const u = await f.user();
+  const bytes = randomBytes(20);
+  expect(await enroll(f, u, bytes));
+  const old = totp(bytes, stepNow() - 1);
+  expect(await enroll(f, u, bytes, stepNow() - 1, { currentCode: old }), 401, 'TWO_FACTOR_INVALID');
+  expect(await enroll(f, u, bytes, stepNow(), { secret: base32(bytes).toLowerCase(), currentCode: totp(bytes) }));
+  expect(await f.api('/api/login', { username: u.username, password, code: totp(bytes) }), 401, 'TWO_FACTOR_INVALID');
+  expect(await enroll(f, u, bytes, stepNow() - 1, { currentCode: totp(bytes, stepNow() + 1) }), 400, 'TWO_FACTOR_INVALID');
+  assert.equal((await f.db.prepare('SELECT totp_last_step FROM users WHERE id = ?').bind(u.id).first()).totp_last_step, stepNow() + 1);
+});
+test('TOTP equivalent zero-padded secret cannot restore a consumed time step', async f => {
+  const u = await f.user();
+  const bytes = randomBytes(20);
+  const equivalent = Buffer.concat([bytes, Buffer.alloc(5)]);
+  assert.equal(totp(bytes), totp(equivalent));
+  expect(await enroll(f, u, bytes));
+  expect(await enroll(f, u, equivalent, stepNow() - 1, { currentCode: totp(bytes) }), 400, 'TWO_FACTOR_INVALID');
+  assert.equal((await f.db.prepare('SELECT totp_last_step FROM users WHERE id = ?').bind(u.id).first()).totp_last_step, stepNow());
+  expect(await f.api('/api/login', { username: u.username, password, code: totp(bytes) }), 401, 'TWO_FACTOR_INVALID');
+});
+test('TOTP replacement stores new setup high water rather than old authenticator step', async f => {
+  const u = await f.user({ otp: true });
+  const bytes = randomBytes(20);
+  expect(await enroll(f, u, bytes, stepNow() - 1, { currentCode: totp(u.otpBytes, stepNow() + 1) }));
+  expect(await f.api('/api/login', { username: u.username, password, code: totp(bytes, stepNow() - 1) }), 401, 'TWO_FACTOR_INVALID');
+  expect(await f.api('/api/login', { username: u.username, password, code: totp(bytes) }));
+});
+test('TOTP secret replacement race cannot consume an obsolete secret', async f => {
+  const u = await f.user({ otp: true });
+  const replacement = base32(randomBytes(20));
+  const original = f.db.prepare.bind(f.db);
+  f.db.prepare = sql => {
+    if (sql.startsWith('UPDATE users SET totp_last_step')) {
+      f.db.sqlite.prepare('UPDATE users SET totp_secret = ?, totp_last_step = NULL WHERE id = ?').run(replacement, u.id);
+    }
+    return original(sql);
+  };
+  expect(await f.api('/api/login', { username: u.username, password, code: totp(u.otpBytes) }), 401, 'TWO_FACTOR_INVALID');
+  assert.equal(f.db.sqlite.prepare('SELECT totp_last_step FROM users WHERE id = ?').get(u.id).totp_last_step, null);
+});
+for (const invalid of ['１２３４５６', '123456\n', 123456, '12345', '1234567']) {
+  test(`TOTP rejects non-six-ASCII-string ${JSON.stringify(invalid)}`, async f => {
+    const u = await f.user({ otp: true });
+    expect(await f.api('/api/login', { username: u.username, password, code: invalid }), 401, 'TWO_FACTOR_INVALID');
+    expect(await enroll(f, u, u.otpBytes, stepNow(), { code: invalid, currentCode: totp(u.otpBytes) }), 400, 'TWO_FACTOR_INVALID');
+  });
+}
+test('TOTP disable clears both secret and high water', async f => {
+  const u = await f.user({ otp: true });
+  expect(await f.api('/api/user/2fa', { password, code: totp(u.otpBytes) }, u.token, 'DELETE'));
+  const row = await f.db.prepare('SELECT totp_secret, totp_last_step FROM users WHERE id = ?').bind(u.id).first();
+  assert.deepEqual(row, { totp_secret: null, totp_last_step: null });
+});
+test('admin TOTP reset clears high water and revokes sessions', async f => {
+  const u = await f.user({ otp: true });
+  expect(await f.api('/api/login', { username: u.username, password, code: totp(u.otpBytes) }));
+  f.env.ADMIN_USERNAME = 'operator'; f.env.ADMIN_PASSWORD = password;
+  const admin = expect(await f.api('/api/login', { username: 'operator', password }));
+  expect(await f.api(`/api/admin/users/${u.id}/2fa`, { scope: 'totp' }, admin.token, 'DELETE'));
+  assert.deepEqual(await f.db.prepare('SELECT totp_secret, totp_last_step FROM users WHERE id = ?').bind(u.id).first(), { totp_secret: null, totp_last_step: null });
+  expect(await f.api('/api/user/2fa/status', undefined, u.token, 'GET'), 401, 'SESSION_INVALID');
+});
+test('rate: login and login-options share ten account attempts across IPs and reset next window', async f => {
+  const u = await f.user({ pk: true });
+  const limiter = f.env.RL_PER_MINUTE_10 = new LocalLimiter();
+  for (let i = 0; i < 10; i++) {
+    const path = i % 2 ? '/api/login' : '/api/auth/passkey-options';
+    expect(await f.api(path, { username: ` ${u.username} `, password: 'wrong', purpose: 'login' }, undefined, 'POST', { 'CF-Connecting-IP': `192.0.2.${i + 2}` }), 401, 'INVALID_CREDENTIALS');
+  }
+  const blocked = await f.api('/api/auth/passkey-options', { username: u.username, password, purpose: 'login' });
+  expect(blocked, 429, 'RATE_LIMITED'); assert.equal(blocked.headers.get('Retry-After'), '60');
+  assert.equal(limiter.buckets.get(`login-user:${u.username}`).count, 11);
+  const now = Date.now(); Date.now = () => now + 60000;
+  expect(await f.api('/api/login', { username: u.username, password }), 401, 'TWO_FACTOR_REQUIRED');
+});
+test('rate: absent CF IP uses one shared bucket despite spoofed proxy headers', async f => {
+  f.env.RL_PER_MINUTE_10 = new LocalLimiter();
+  for (let i = 0; i < 11; i++) {
+    const response = await f.api('/api/register', {}, undefined, 'POST', {
+      'CF-Connecting-IP': null, 'X-Forwarded-For': `192.0.2.${i}`, 'X-Real-IP': `198.51.100.${i}`,
+    });
+    expect(response, i < 10 ? 400 : 429, i < 10 ? 'INVALID_REQUEST' : 'RATE_LIMITED');
+  }
+});
+for (const path of ['/api/auth/passkey-options', '/api/auth/passkey-verify']) {
+  test(`rate: ${path} retains its ten/min IP bucket`, async f => {
+    f.env.RL_PER_MINUTE_10 = new LocalLimiter();
+    for (let i = 0; i < 10; i++) {
+      const response = await f.api(path, {});
+      expect(response, path.endsWith('options') ? 200 : 400);
+    }
+    const response = await f.api(path, {});
+    expect(response, 429, 'RATE_LIMITED'); assert.equal(response.headers.get('Retry-After'), '60');
+  });
+}
+test('rate: account limiter failure after successful IP check is 503', async f => {
+  const u = await f.user();
+  f.env.RL_PER_MINUTE_10 = { limit: async ({ key }) => {
+    if (key.startsWith('login-user:') || key.startsWith('sensitive-user:')) throw new Error('account limiter outage');
+    return { success: true };
+  } };
+  expect(await f.api('/api/login', { username: u.username, password }), 503, 'SERVICE_UNAVAILABLE');
+  expect(await f.api('/api/auth/passkey-options', { username: u.username, password, purpose: 'login' }), 503, 'SERVICE_UNAVAILABLE');
+  expect(await f.api('/api/user/2fa/backup-codes/generate', { password }, u.token), 503, 'SERVICE_UNAVAILABLE');
+});
+const rechecks = [
+  ['/api/user/password', 'POST', { currentPassword: 'wrong', newPassword }],
+  ['/api/user/me', 'DELETE', { password: 'wrong' }],
+  ['/api/user/passkey/auth-options', 'POST', { password: 'wrong', purpose: 'password' }],
+  ['/api/user/2fa/enable', 'POST', {}], ['/api/user/2fa', 'DELETE', { password: 'wrong', code: '123456' }],
+  ['/api/user/2fa/backup-codes/generate', 'POST', { password: 'wrong' }],
+  ['/api/user/passkey/register', 'POST', {}], ['/api/user/passkeys/missing', 'DELETE', { password: 'wrong' }],
+  ['/api/user/passkey/register-options', 'POST', {}], ['/api/user/2fa/setup', 'POST', {}],
+];
+test('rate: every password/factor/enrollment path shares the userId ten/min budget', async f => {
+  const u = await f.user();
+  const limiter = f.env.RL_PER_MINUTE_10 = new LocalLimiter();
+  for (let i = 0; i < rechecks.length; i++) {
+    const [path, method, body] = rechecks[i];
+    const response = await f.api(path, body, i % 2 ? u.token2 : u.token, method, { 'CF-Connecting-IP': `192.0.2.${i + 2}` });
+    assert.notEqual(response.status, 429);
+    assert.notEqual(response.status, 503);
+  }
+  for (const [path, method, body] of rechecks) {
+    expect(await f.api(path, body, u.token, method, { 'CF-Connecting-IP': randomUUID() }), 429, 'RATE_LIMITED');
+  }
+  assert.equal(limiter.buckets.get(`sensitive-user:${u.id}`).count, 20);
+});
+for (const mode of ['missing', 'throws']) {
+  test(`rate: strict ${mode} binding gives 503 on all auth paths but not public reads`, async f => {
+    const u = await f.user();
+    if (mode === 'missing') delete f.env.RL_PER_MINUTE_10;
+    else f.env.RL_PER_MINUTE_10 = { limit: async () => { throw new Error('limiter outage'); } };
+    for (const [path, method, body, token] of [
+      ['/api/login', 'POST', { username: u.username, password }], ['/api/register', 'POST', {}],
+      ['/api/auth/passkey-options', 'POST', {}], ['/api/auth/passkey-verify', 'POST', {}],
+      ...rechecks.map(([p, m, b]) => [p, m, b, u.token]),
+    ]) {
+      const response = await f.api(path, body, token, method);
+      expect(response, 503, 'SERVICE_UNAVAILABLE'); assert.equal(response.headers.get('Retry-After'), null);
+    }
+    delete f.env.RL_PER_MINUTE_30; delete f.env.RL_PER_MINUTE_60;
+    expect(await f.api('/api/notice', undefined, undefined, 'GET'));
+    expect(await f.api('/api/transparency', undefined, undefined, 'GET'));
+  });
+}
+
 let temp;
 let failed = 0;
 try {
@@ -453,6 +640,9 @@ try {
   worker = (await import(pathToFileURL(join(temp, 'worker.mjs')).href)).default;
   for (const { name, run } of tests) {
     let f;
+    const realNow = Date.now;
+    const frozenNow = Math.floor(realNow() / 60000) * 60000 + 15000;
+    Date.now = () => frozenNow;
     try {
       f = await fixture();
       await run(f);
@@ -461,6 +651,7 @@ try {
       failed++;
       console.error(`FAIL ${name}\n${error.stack ?? error}`);
     } finally {
+      Date.now = realNow;
       if (f) await f.close();
     }
   }
