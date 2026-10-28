@@ -19,6 +19,7 @@ const { render, fireEvent, cleanup, waitFor } = await import('@testing-library/r
 await build({
     stdin: { contents: `export { default as Settings } from './src/pages/Settings';
         export { default as PKParamsPage } from './src/pages/PKParams';
+        export { default as TransparencySettings } from './src/pages/TransparencySettings';
         export { default as Forecast } from './src/pages/Forecast';
         export * from './logic'; export { TRANSLATIONS } from './src/i18n/translations';`,
         resolveDir: root, loader: 'tsx' },
@@ -41,7 +42,7 @@ await build({
                export const adherenceOf = () => ({missRate: 0, jitterSdH: 0});` }));
     } }],
 });
-const { Settings, PKParamsPage, Forecast, DEFAULT_PK_PARAMS, TRANSLATIONS } = await import(pathToFileURL(join(tmp, 'settings.mjs')));
+const { Settings, PKParamsPage, TransparencySettings, Forecast, DEFAULT_PK_PARAMS, TRANSLATIONS } = await import(pathToFileURL(join(tmp, 'settings.mjs')));
 const t = key => TRANSLATIONS.zh[key] ?? key;
 globalThis.__slT = t;
 after(async () => { cleanup(); dom.window.close(); await rm(tmp, { recursive: true, force: true }); });
@@ -81,6 +82,31 @@ test('transmasc settings omit the estradiol sublingual model control', () => {
     const view = render(React.createElement(Settings, props()));
     assert.equal(view.queryByRole('radiogroup', { name: t('settings.sublingual_model') }), null);
     cleanup(); globalThis.__slMode = 'transfem';
+});
+
+test('transparency distinguishes a failed request from zero counts and can retry', async () => {
+    const originalFetch = globalThis.fetch;
+    let view;
+    try {
+        globalThis.fetch = async () => new Response('<html>app shell</html>');
+        view = render(React.createElement(TransparencySettings, { onBack() {} }));
+        await waitFor(() => assert.equal(view.getByRole('alert').textContent.trim(), t('transparency.load_error')));
+        assert.ok(view.getAllByText('—').length >= 5);
+        assert.equal(view.queryByText(t('transparency.recent.empty')), null);
+        globalThis.fetch = async () => Response.json({ total_users: 17, total_backups: 23,
+            new_users_24h: 0, new_users_7d: 3, admin_deleted_count: 0, self_deleted_count: 2,
+            admin_deleted_7d: 0, self_deleted_7d: 1, recent_registrations: [], server_time: 2000000000 });
+        fireEvent.click(view.getByRole('button', { name: t('transparency.refresh') }));
+        await waitFor(() => assert.equal(view.queryByRole('alert'), null));
+        await waitFor(() => assert.ok(view.getByText('17')));
+        assert.ok(view.getByText('23'));
+        assert.ok(view.getAllByText('0').length >= 2);
+        assert.ok(view.getByText(t('transparency.recent.empty')));
+    } finally {
+        view?.unmount();
+        globalThis.fetch = originalFetch;
+        cleanup();
+    }
 });
 
 test('every language supplies the complete model selector without legacy route names', () => {

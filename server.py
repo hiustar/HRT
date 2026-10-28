@@ -196,6 +196,14 @@ def init_db():
             data_size INTEGER
         )
     ''')
+    c.execute('''CREATE TABLE IF NOT EXISTS deletion_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reason TEXT NOT NULL,
+        user_created_at INTEGER,
+        deleted_at INTEGER NOT NULL
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_deletion_log_deleted_at ON deletion_log(deleted_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_deletion_log_reason ON deletion_log(reason)')
     c.execute('''
         CREATE TABLE IF NOT EXISTS webauthn_challenges (
             token TEXT PRIMARY KEY,
@@ -899,6 +907,43 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
             url = urllib.parse.urlparse(self.path)
             path = url.path
 
+            # Public, anonymous statistics, matching the Worker API contract.
+            if path == '/api/transparency':
+                forwarded = ','.join(self.headers.get_all('X-Forwarded-For', []))
+                self.auth_rate_limit('transparency', auth_client_ip(self.client_address[0], forwarded), 30)
+                now = int(time.time())
+                week_ago = now - 7 * 86400
+                with closing(sqlite3.connect(DB_PATH)) as conn:
+                    # All counts should describe the same database snapshot.
+                    conn.execute('BEGIN')
+                    users = conn.execute('''SELECT COUNT(*),
+                        COUNT(CASE WHEN created_at >= ? THEN 1 END),
+                        COUNT(CASE WHEN created_at >= ? THEN 1 END)
+                        FROM users WHERE id != 'admin' ''', (now - 86400, week_ago)).fetchone()
+                    backups = conn.execute('SELECT COUNT(*) FROM backups').fetchone()[0]
+                    deletions = {reason: (total, recent) for reason, total, recent in conn.execute('''
+                        SELECT reason, COUNT(*), COUNT(CASE WHEN deleted_at >= ? THEN 1 END)
+                        FROM deletion_log GROUP BY reason''', (week_ago,))}
+                    recent = conn.execute('''SELECT id, created_at FROM users WHERE id != 'admin'
+                        ORDER BY created_at DESC, id DESC LIMIT 10''').fetchall()
+                admin_deleted = deletions.get('admin', (0, 0))
+                self_deleted = deletions.get('self', (0, 0))
+                return self.send_json({
+                    'total_users': users[0],
+                    'total_backups': backups,
+                    'new_users_24h': users[1],
+                    'new_users_7d': users[2],
+                    'admin_deleted_count': admin_deleted[0],
+                    'self_deleted_count': self_deleted[0],
+                    'admin_deleted_7d': admin_deleted[1],
+                    'self_deleted_7d': self_deleted[1],
+                    'recent_registrations': [{
+                        'anon_id': re.sub(r'[^a-f0-9]', '', str(uid), flags=re.I)[:4].lower().ljust(4, '0'),
+                        'created_at': (created_at or 0) // 3600 * 3600,
+                    } for uid, created_at in recent],
+                    'server_time': now,
+                })
+
             # 1. 认证状态检查: GET /api/user/me 或 /api/user/profile
             if path in ('/api/user/me', '/api/user/profile'):
                 auth_user = self.get_token_user()
@@ -1061,6 +1106,9 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
 
                 # 物理删除该用户的一切数据
                 uid = auth_user['user_id']
+                # Only anonymous timestamps survive account deletion.
+                c.execute('''INSERT INTO deletion_log (reason, user_created_at, deleted_at)
+                    SELECT 'self', created_at, ? FROM users WHERE id = ?''', (int(time.time()), uid))
                 c.execute('DELETE FROM users WHERE id = ?', (uid,))
                 c.execute('DELETE FROM sessions WHERE user_id = ?', (uid,))
                 c.execute('DELETE FROM backups WHERE user_id = ?', (uid,))

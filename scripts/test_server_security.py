@@ -422,6 +422,37 @@ class ServerSecurityTests(SecurityHTTPCase):
         self.addCleanup(replacement.stop)
         super().setUp()
 
+    def test_transparency_uses_real_data_and_records_anonymous_account_deletion(self):
+        before = self.ok('GET', '/api/transparency')
+        self.sql('INSERT INTO users (id, username, created_at) VALUES (?, ?, ?)',
+                 (uuid.uuid4().hex, 'old_' + uuid.uuid4().hex, int(time.time()) - 8 * 86400))
+        self.ok('POST', '/api/content', {'data': {'private_marker': 'not_public'}}, self.token)
+        status, headers, stats = self.request('GET', '/api/transparency')
+        self.assertEqual(status, 200)
+        self.assertIn('application/json', headers['content-type'])
+        self.assertEqual(stats['total_users'], before['total_users'] + 1)
+        self.assertEqual(stats['total_backups'], before['total_backups'] + 1)
+        self.assertEqual(stats['new_users_24h'], before['new_users_24h'])
+        self.assertEqual(stats['new_users_7d'], before['new_users_7d'])
+        self.assertLessEqual(len(stats['recent_registrations']), 10)
+        for entry in stats['recent_registrations']:
+            self.assertEqual(set(entry), {'anon_id', 'created_at'})
+            self.assertRegex(entry['anon_id'], r'^[a-f0-9]{4}$')
+            self.assertEqual(entry['created_at'] % 3600, 0)
+        body = json.dumps(stats)
+        for private in (self.username, self.user_id, self.token, 'not_public'):
+            self.assertNotIn(private, body)
+        status, _, _ = self.request('DELETE', '/api/user/me', {'password': 'incorrect'}, self.token)
+        self.assertEqual(status, 401)
+        self.assertEqual(self.ok('GET', '/api/transparency')['self_deleted_count'], before['self_deleted_count'])
+        self.ok('DELETE', '/api/user/me', {'password': PASSWORD}, self.token)
+        after = self.ok('GET', '/api/transparency')
+        self.assertEqual(after['total_users'], stats['total_users'] - 1)
+        self.assertEqual(after['total_backups'], before['total_backups'])
+        self.assertEqual(after['self_deleted_count'], before['self_deleted_count'] + 1)
+        self.assertEqual(after['self_deleted_7d'], before['self_deleted_7d'] + 1)
+        self.assertEqual(after['admin_deleted_count'], before['admin_deleted_count'])
+
     def test_cloud_backup_retention_prunes_existing_excess_and_isolates_users(self):
         other = self.ok("POST", "/api/register", {"username": "other_" + uuid.uuid4().hex, "password": PASSWORD})
         other_id = other["user"]["id"]

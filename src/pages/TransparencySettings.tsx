@@ -1,5 +1,6 @@
 import { formatRelative } from '../utils/helpers';
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { RefreshCw } from 'lucide-react';
 import PageHeader, { PAGE_COLUMN } from '../components/PageHeader';
 
 import { useTranslation } from '../contexts/LanguageContext';
@@ -19,6 +20,22 @@ interface TransparencyStats {
 
 const REFRESH_INTERVAL_MS = 30_000;
 
+const COUNT_KEYS = ['total_users', 'total_backups', 'new_users_24h', 'new_users_7d',
+    'admin_deleted_count', 'self_deleted_count', 'admin_deleted_7d', 'self_deleted_7d'] as const;
+
+function isTransparencyStats(value: unknown): value is TransparencyStats {
+    if (value === null || typeof value !== 'object') return false;
+    const data = value as Record<string, unknown>;
+    return COUNT_KEYS.every(key => typeof data[key] === 'number' && Number.isSafeInteger(data[key]) && (data[key] as number) >= 0)
+        && typeof data.server_time === 'number' && Number.isFinite(data.server_time)
+        && Array.isArray(data.recent_registrations)
+        && data.recent_registrations.every(r => r && typeof r.anon_id === 'string'
+            && /^[a-f0-9]{4}$/.test(r.anon_id)
+            && typeof r.created_at === 'number' && Number.isFinite(r.created_at));
+}
+
+const displayCount = (value: number | undefined) => value === undefined ? '—' : value.toLocaleString();
+
 const rowBase = "flex items-baseline justify-between py-[18px] border-b border-[var(--border)]";
 
 interface TransparencySettingsProps {
@@ -28,7 +45,7 @@ interface TransparencySettingsProps {
 const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) => {
     const { t } = useTranslation();
     const [stats, setStats] = useState<TransparencyStats | null>(null);
-    const [loading, setLoading] = useState(false);
+    const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [lastUpdated, setLastUpdated] = useState<number | null>(null);
     const timerRef = useRef<number | null>(null);
@@ -39,7 +56,8 @@ const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) =
         try {
             const res = await fetch('/api/transparency', { signal, cache: 'no-store' });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json() as TransparencyStats;
+            const data: unknown = await res.json();
+            if (!isTransparencyStats(data)) throw new Error('Invalid transparency response');
             setStats(data);
             setLastUpdated(Date.now());
         } catch (e: any) {
@@ -53,7 +71,7 @@ const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) =
     useEffect(() => {
         const ctrl = new AbortController();
         load(ctrl.signal);
-        timerRef.current = window.setInterval(() => load(), REFRESH_INTERVAL_MS);
+        timerRef.current = window.setInterval(() => load(ctrl.signal), REFRESH_INTERVAL_MS);
         return () => {
             ctrl.abort();
             if (timerRef.current) window.clearInterval(timerRef.current);
@@ -67,27 +85,34 @@ const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) =
             {/* Header */}
             <PageHeader onBack={onBack} title={t('transparency.title')} />
 
-            {lastUpdated && (
-                <p className="px-6 md:px-8 text-xs text-[var(--text-muted)] mb-6">
-                    {t('transparency.last_updated').replace('{t}', new Date(lastUpdated).toLocaleTimeString())}
-                </p>
-            )}
-
             <div className={PAGE_COLUMN}>
+                <p className="mt-3 text-sm leading-relaxed text-[var(--text-muted)]">{t('transparency.intro')}</p>
+                <div className="my-4 flex items-center justify-between gap-3">
+                    <p role="status" className="text-xs text-[var(--text-muted)]">
+                        {lastUpdated
+                            ? t('transparency.last_updated').replace('{t}', new Date(lastUpdated).toLocaleTimeString())
+                            : loading ? t('transparency.loading') : '—'}
+                    </p>
+                    <button type="button" onClick={() => load()} disabled={loading}
+                        className="flex min-h-11 items-center gap-2 rounded-[var(--radius-md)] px-3 text-sm text-[var(--text-muted)] hover:bg-[var(--surface-hover)] hover:text-[var(--text)] disabled:opacity-50">
+                        <RefreshCw size={15} className={loading ? 'animate-spin motion-reduce:animate-none' : ''} />
+                        {t('transparency.refresh')}
+                    </button>
+                </div>
                 {error && (
-                    <p className="mb-4 text-sm text-[var(--danger)]">
+                    <p role="alert" className="mb-4 text-sm text-[var(--danger)]">
                         {error}
                     </p>
                 )}
 
                 {/* Stats */}
-                <div>
+                <div aria-busy={loading}>
                     <div className={rowBase}>
                         <span className="text-[0.9375rem] text-[var(--text)]">
                             {t('transparency.stat.total_users')}
                         </span>
                         <span className="text-2xl font-semibold text-[var(--text)] tabular-nums">
-                            {(stats?.total_users ?? 0).toLocaleString()}
+                            {displayCount(stats?.total_users)}
                         </span>
                     </div>
 
@@ -96,7 +121,7 @@ const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) =
                             {t('transparency.stat.total_backups')}
                         </span>
                         <span className="text-2xl font-semibold text-[var(--text)] tabular-nums">
-                            {(stats?.total_backups ?? 0).toLocaleString()}
+                            {displayCount(stats?.total_backups)}
                         </span>
                     </div>
 
@@ -106,11 +131,11 @@ const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) =
                                 {t('transparency.stat.new_users_24h')}
                             </p>
                             <p className="text-xs text-[var(--text-muted)] mt-0.5">
-                                {t('transparency.stat.new_users_7d').replace('{n}', String(stats?.new_users_7d ?? 0))}
+                                {t('transparency.stat.new_users_7d').replace('{n}', displayCount(stats?.new_users_7d))}
                             </p>
                         </div>
                         <span className="text-2xl font-semibold text-[var(--text)] tabular-nums">
-                            {(stats?.new_users_24h ?? 0).toLocaleString()}
+                            {displayCount(stats?.new_users_24h)}
                         </span>
                     </div>
 
@@ -120,11 +145,11 @@ const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) =
                                 {t('transparency.stat.self_deleted')}
                             </p>
                             <p className="text-xs text-[var(--text-muted)] mt-0.5">
-                                {t('transparency.stat.delta_7d').replace('{n}', String(stats?.self_deleted_7d ?? 0))}
+                                {t('transparency.stat.delta_7d').replace('{n}', displayCount(stats?.self_deleted_7d))}
                             </p>
                         </div>
                         <span className="text-2xl font-semibold text-[var(--text)] tabular-nums">
-                            {(stats?.self_deleted_count ?? 0).toLocaleString()}
+                            {displayCount(stats?.self_deleted_count)}
                         </span>
                     </div>
 
@@ -134,11 +159,11 @@ const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) =
                                 {t('transparency.stat.admin_deleted')}
                             </p>
                             <p className="text-xs text-[var(--text-muted)] mt-0.5">
-                                {t('transparency.stat.delta_7d').replace('{n}', String(stats?.admin_deleted_7d ?? 0))}
+                                {t('transparency.stat.delta_7d').replace('{n}', displayCount(stats?.admin_deleted_7d))}
                             </p>
                         </div>
                         <span className="text-2xl font-semibold text-[var(--text)] tabular-nums">
-                            {(stats?.admin_deleted_count ?? 0).toLocaleString()}
+                            {displayCount(stats?.admin_deleted_count)}
                         </span>
                     </div>
                 </div>
@@ -149,7 +174,11 @@ const TransparencySettings: React.FC<TransparencySettingsProps> = ({ onBack }) =
                 </h2>
 
                 <div className="divide-y divide-[var(--border)]">
-                    {(stats?.recent_registrations ?? []).length === 0 && !loading ? (
+                    {!stats ? (
+                        <p className="py-6 text-sm text-center text-[var(--text-muted)]">
+                            {loading ? t('transparency.loading') : '—'}
+                        </p>
+                    ) : stats.recent_registrations.length === 0 ? (
                         <p className="py-6 text-sm text-center text-[var(--text-muted)]">
                             {t('transparency.recent.empty')}
                         </p>

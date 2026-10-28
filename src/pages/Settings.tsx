@@ -334,8 +334,12 @@ const Settings: React.FC<SettingsProps> = ({
                     onClick={() => showDialog('confirm', t('drawer.model_confirm'), () => window.open('https://mahiro.uk/articles/estrogen-model-summary', '_blank'))}
                 />
                 <NavRow
-                    label={t('drawer.github')}
-                    onClick={() => showDialog('confirm', t('drawer.github_confirm'), () => window.open('https://github.com/SmirnovaOyama/Oyama-s-HRT-recorder', '_blank'))}
+                    label={t('drawer.github_original')}
+                    onClick={() => showDialog('confirm', t('drawer.github_confirm'), () => window.open('https://github.com/SmirnovaOyama/Oyama-s-HRT-recorder', '_blank', 'noopener,noreferrer'))}
+                />
+                <NavRow
+                    label={t('drawer.github_fork')}
+                    onClick={() => showDialog('confirm', t('drawer.github_confirm'), () => window.open('https://github.com/hiustar/HRT', '_blank', 'noopener,noreferrer'))}
                 />
                 <NavRow label={t('transparency.title')} onClick={() => navTo(onNavigateToTransparency, 'about')} />
                 <NavRow label={t('drawer.disclaimer')} onClick={() => setIsDisclaimerOpen(true)} />
