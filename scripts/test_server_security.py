@@ -422,6 +422,26 @@ class ServerSecurityTests(SecurityHTTPCase):
         self.addCleanup(replacement.stop)
         super().setUp()
 
+    def test_cloud_backup_retention_prunes_existing_excess_and_isolates_users(self):
+        other = self.ok("POST", "/api/register", {"username": "other_" + uuid.uuid4().hex, "password": PASSWORD})
+        other_id = other["user"]["id"]
+        now = int(time.time())
+        for i in range(120):
+            self.sql("INSERT INTO backups (id, user_id, data, created_at, data_size) VALUES (?, ?, ?, ?, ?)",
+                     (f"old_{i}", self.user_id, "{}", now - i * 86400, 2))
+        self.sql("INSERT INTO backups (id, user_id, data, created_at, data_size) VALUES (?, ?, ?, ?, ?)",
+                 ("other_backup", other_id, "{}", now, 2))
+        saved = self.ok("POST", "/api/content", {"data": {"value": 123}}, self.token)
+        backups = self.ok("GET", "/api/content", token=self.token)
+        self.assertEqual(len(backups), 10)
+        self.assertIn(saved["id"], {b["id"] for b in backups})
+        self.assertIn("old_30", {b["id"] for b in backups})
+        self.assertEqual(self.sql("SELECT id FROM backups WHERE user_id = ?", (other_id,)), [("other_backup",)])
+        self.assertEqual(json.loads(self.ok("GET", "/api/content/" + saved["id"], token=self.token)["data"]), {"value": 123})
+        for i in range(3):
+            self.ok("POST", "/api/content", {"data": {"value": i}}, self.token)
+        self.assertEqual(len(self.ok("GET", "/api/content", token=self.token)), 10)
+
     def test_session_registration_and_login_are_valid(self):
         self.alive(self.token)
         self.alive(self.login())

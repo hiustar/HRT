@@ -1625,10 +1625,13 @@ export default {
             ).bind(userId).all<{ id: string; created_at: number }>();
             const keep = selectBackupsToKeep(revisions.results, id);
             const stale = revisions.results.filter(r => !keep.has(r.id)).map(r => r.id);
-            if (stale.length > 0) {
+            // Bound parameter limits can otherwise prevent cleanup of accounts
+            // that accumulated a large number of revisions on older servers.
+            for (let i = 0; i < stale.length; i += 90) {
+              const batch = stale.slice(i, i + 90);
               await env.DB.prepare(
-                `DELETE FROM content WHERE user_id = ? AND id IN (${stale.map(() => '?').join(',')})`
-              ).bind(userId, ...stale).run();
+                `DELETE FROM content WHERE user_id = ? AND id IN (${batch.map(() => '?').join(',')})`
+              ).bind(userId, ...batch).run();
             }
             return withSecurityHeaders(new Response(JSON.stringify({ message: 'Content saved', id }), { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }));
           }

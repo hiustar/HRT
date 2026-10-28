@@ -93,6 +93,7 @@ const Account: React.FC<AccountProps> = ({
     // page (which remounts Account) reflects a freshly uploaded image.
     const avatarCacheBuster = useMemo(() => Date.now(), []);
     const avatarUrl = `/api/user/avatar/${user?.username}?t=${avatarCacheBuster}`;
+    const [backupListOpen, setBackupListOpen] = useState(false);
     const [backupList, setBackupList] = useState<BackupMeta[]>([]);
     const [backupsLoading, setBackupsLoading] = useState(false);
     const [savingCloud, setSavingCloud] = useState(false);
@@ -498,8 +499,17 @@ const Account: React.FC<AccountProps> = ({
                             )}
                         />
 
-                        {/* Backup list */}
-                        {backupsLoading ? (
+                        {/* The full history is collapsed by default; individual revisions
+                            remain independently expandable after opening the list. */}
+                        <button type="button" aria-expanded={backupListOpen}
+                            onClick={() => setBackupListOpen(open => !open)}
+                            className="flex w-full items-center gap-3 py-4 text-left">
+                            <HardDrive size={18} className={iconCls} />
+                            <span className="flex-1 text-sm font-medium text-[var(--text)]">{t('account.backup_history')}</span>
+                            <span className={`${statusMuted} tabular-nums`}>{backupList.length}/{MAX_CLOUD_BACKUPS}</span>
+                            <ChevronDown size={16} className={`chev ${iconCls} ${backupListOpen ? 'rotate-180' : ''}`} />
+                        </button>
+                        {backupListOpen && (backupsLoading ? (
                             <div className="flex justify-center py-6">
                                 <Loader2 className="animate-spin text-[var(--text-muted)]" size={20} />
                             </div>
@@ -686,7 +696,7 @@ const Account: React.FC<AccountProps> = ({
                                     </div>
                                 </div>
                             ))
-                        )}
+                        ))}
                         </div>
                     </section>
 

@@ -29,6 +29,30 @@ SESSION_MAX_AGE = 7 * 86400
 SESSION_IDLE_TIMEOUT = 3 * 86400
 CHALLENGE_MAX_AGE = 300
 
+# Keep in sync with backupPolicy.ts. Old revisions are pruned only after a
+# successful new save, within the same transaction as the insertion.
+MAX_CLOUD_BACKUPS = 10
+BACKUP_RETENTION_HORIZONS_S = (3600, 86400, 7 * 86400, 30 * 86400)
+
+
+def select_backups_to_keep(revisions, just_written_id, max_backups=MAX_CLOUD_BACKUPS):
+    if not revisions or max_backups <= 0:
+        return set()
+    ordered = sorted(revisions, key=lambda r: (r[0] == just_written_id, r[1], r[0]), reverse=True)
+    keep = {ordered[0][0]}
+    newest_time = ordered[0][1]
+    for horizon in BACKUP_RETENTION_HORIZONS_S:
+        if len(keep) >= max_backups:
+            break
+        candidate = next((r for r in ordered if r[1] <= newest_time - horizon and r[0] not in keep), None)
+        if candidate:
+            keep.add(candidate[0])
+    for revision_id, _ in ordered:
+        if len(keep) >= max_backups:
+            break
+        keep.add(revision_id)
+    return keep
+
 
 def normalize_origin(value):
     value = value.strip().rstrip('/')
@@ -845,18 +869,21 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     content_str = str(content_data or '')
 
-                bk_id = f"bk_{int(time.time()*1000)}"
+                bk_id = f"bk_{secrets.token_hex(16)}"
                 now_ts = int(time.time())
                 data_size = len(content_str.encode('utf-8'))
 
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute(
-                    'INSERT INTO backups (id, user_id, data, created_at, data_size) VALUES (?, ?, ?, ?, ?)',
-                    (bk_id, auth_user['user_id'], content_str, now_ts, data_size)
-                )
-                conn.commit()
-                conn.close()
+                with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    conn.execute(
+                        'INSERT INTO backups (id, user_id, data, created_at, data_size) VALUES (?, ?, ?, ?, ?)',
+                        (bk_id, auth_user['user_id'], content_str, now_ts, data_size)
+                    )
+                    revisions = conn.execute('SELECT id, created_at FROM backups WHERE user_id = ?',
+                                             (auth_user['user_id'],)).fetchall()
+                    keep = select_backups_to_keep(revisions, bk_id)
+                    conn.executemany('DELETE FROM backups WHERE user_id = ? AND id = ?',
+                                     ((auth_user['user_id'], rid) for rid, _ in revisions if rid not in keep))
                 return self.send_json({"id": bk_id})
 
             return self.send_error_json(404, 'NOT_FOUND', 'Not Found')

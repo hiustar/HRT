@@ -11,7 +11,7 @@
  */
 
 /** Revisions kept per account. The Account page shows "n/MAX_CLOUD_BACKUPS". */
-export const MAX_CLOUD_BACKUPS = 5;
+export const MAX_CLOUD_BACKUPS = 10;
 
 /**
  * Largest request body the backup endpoint accepts. The client checks its own
