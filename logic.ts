@@ -1,3 +1,10 @@
+import {
+    getEstrogenMetaboliteProfile,
+    swallowedEstrogenInput,
+    type EstrogenAmounts,
+    type EstrogenMetaboliteProfile,
+} from './src/pk/estradiolMetabolites';
+
 // --- Types & Enums ---
 
 export enum Route {
@@ -967,6 +974,20 @@ const OralPK = {
     kAbsSL: 1.8
 };
 
+/**
+ * Evidence-informed approximation, NOT a population-PK fit. The fast uptake
+ * shape is consistent with Price (1997, PMID 9052581) and Doll (2022,
+ * PMID 34781041); those studies do not identify a universal absolute F.
+ * Retain the previous new-route amplitude/uptake priors rather than fitting a
+ * baseline-free dose contribution to a study's total serum Cmax. In particular,
+ * effectiveFastFraction is NOT a measured bioavailability or a redistribution
+ * compartment. See docs/sublingual-model-review.md for evidence and limitations.
+ */
+const SublingualNewPK = {
+    kAbsFast: 2.4, // h^-1; effective uptake including dissolution, inherited prior
+    effectiveFastFraction: 0.28, // empirical amplitude prior, not measured F
+};
+
 // Define deterministic order for mapping integer tiers (0-3)   to keys
 export const SL_TIER_ORDER = ["quick", "casual", "standard", "strict"] as const;
 
@@ -990,7 +1011,9 @@ export interface PKCustomParams {
     e2_ff_EN: number;        // Estradiol Enanthate (default: 0.12)
     e2_ff_EU: number;        // Estradiol Undecylate (default: 0.040)
     // E2 oral/sublingual
-    e2_oral_bio: number;     // oral bioavailability fraction (default: 0.03)
+    e2_oral_bio: number;     // direct-E2 input coefficient, before metabolite return (default: 0.03)
+    e2_recycle_strength: number; // sensitivity scale on E1/E1S return fluxes (default: 1; 0 disables return)
+    e2_sulfate_halfLifeH: number; // E1S pool turnover prior, NOT E2 terminal half-life (default: 12 h)
     e2_sl_quick: number;     // SL theta — quick tier (default: 0.01)
     e2_sl_casual: number;    // SL theta — casual tier (default: 0.04)
     e2_sl_standard: number;  // SL theta — standard tier (default: 0.11)
@@ -1022,6 +1045,8 @@ export const DEFAULT_PK_PARAMS: PKCustomParams = {
     e2_ff_EN: 0.12,
     e2_ff_EU: 0.040,
     e2_oral_bio: 0.03,
+    e2_recycle_strength: 1,
+    e2_sulfate_halfLifeH: 12,
     e2_sl_quick: 0.01,
     e2_sl_casual: 0.04,
     e2_sl_standard: 0.11,
@@ -1106,6 +1131,8 @@ export const PK_PARAM_RANGES: Record<keyof PKCustomParams, readonly [number, num
     e2_ff_EN: [0, 1],
     e2_ff_EU: [0, 1],
     e2_oral_bio: [0, 1],
+    e2_recycle_strength: [0, 3],
+    e2_sulfate_halfLifeH: [4, 36],
     e2_sl_quick: [0, 1],
     e2_sl_casual: [0, 1],
     e2_sl_standard: [0, 1],
@@ -1184,6 +1211,36 @@ function _getSLTheta(tierKey: string): number {
     if (tierKey === 'casual') return p.e2_sl_casual;
     if (tierKey === 'strict') return p.e2_sl_strict;
     return p.e2_sl_standard;
+}
+
+// The swallowed part of the revised SL route must use exactly the same
+// effective absorption as an oral dose of the same compound. This preserves
+// theta=0 -> oral, including existing oral-model limitations (notably EV).
+function _getOralE2AbsorptionRate(ester: Ester): number {
+    return ester === Ester.EV ? OralPK.kAbsEV : OralPK.kAbsE2;
+}
+
+function _getActiveE2Metabolites(): EstrogenMetaboliteProfile {
+    return getEstrogenMetaboliteProfile(
+        _activePKParams.e2_kClear,
+        _activePKParams.e2_recycle_strength,
+        _activePKParams.e2_sulfate_halfLifeH,
+    );
+}
+
+// Shared by the revised route's direct-input display and its actual simulation.
+// Persisted hold tiers remain heuristic split weights, not measured absorption.
+function _getSublingualNewTheta(extras: Partial<Record<ExtraKey, number>>): number {
+    const custom = extras[ExtraKey.sublingualTheta];
+    if (typeof custom === 'number' && Number.isFinite(custom)) {
+        return Math.min(1, Math.max(0, custom));
+    }
+    const tier = extras[ExtraKey.sublingualTier];
+    if (typeof tier === 'number' && Number.isFinite(tier)) {
+        const index = Math.min(SL_TIER_ORDER.length - 1, Math.max(0, Math.round(tier)));
+        return _getSLTheta(SL_TIER_ORDER[index]);
+    }
+    return _activePKParams.e2_sl_standard;
 }
 
 function _getE2InjFF(ester: Ester): number {
@@ -1271,18 +1328,8 @@ export function getBioavailabilityMultiplier(
             return (theta + (1 - theta) * _activePKParams.e2_oral_bio) * mwFactor;
         }
         case Route.sublingualNew: {
-            let theta = _activePKParams.e2_sl_standard;
-            if (extras[ExtraKey.sublingualTheta] !== undefined) {
-                const customTheta = extras[ExtraKey.sublingualTheta];
-                if (typeof customTheta === 'number' && Number.isFinite(customTheta)) {
-                    theta = Math.min(1, Math.max(0, customTheta));
-                }
-            } else if (extras[ExtraKey.sublingualTier] !== undefined) {
-                const tierIdx = Math.min(SL_TIER_ORDER.length - 1, Math.max(0, Math.round(extras[ExtraKey.sublingualTier]!)));
-                const tierKey = SL_TIER_ORDER[tierIdx] || 'standard';
-                theta = _getSLTheta(tierKey);
-            }
-            return (theta * 0.28 + (1 - theta) * _activePKParams.e2_oral_bio) * mwFactor;
+            const theta = _getSublingualNewTheta(extras);
+            return (theta * SublingualNewPK.effectiveFastFraction + (1 - theta) * _activePKParams.e2_oral_bio) * mwFactor;
         }
         case Route.gel: {
             const siteIdx = Math.min(GEL_SITE_ORDER.length - 1, Math.max(0, Math.round(extras[ExtraKey.gelSite] ?? 0)));
@@ -1310,6 +1357,9 @@ interface PKParams {
     rateMGh: number;
     F_fast: number;
     F_slow: number;
+    // Oral E2/EV and revised SL share this snapshot. Legacy routes stay frozen.
+    metabolites?: EstrogenMetaboliteProfile;
+    oralInput?: EstrogenAmounts; // E2/E1/E1S molar-equivalent input per mg dose
 }
 
 function resolveParams(event: DoseEvent): PKParams {
@@ -1390,27 +1440,19 @@ function resolveParams(event: DoseEvent): PKParams {
             return { Frac_fast: theta, k1_fast, k1_slow, k2, k3: defaultK3, F, rateMGh: 0, F_fast, F_slow };
         }
         case Route.sublingualNew: {
-            let theta = _activePKParams.e2_sl_standard;
-            if (extras[ExtraKey.sublingualTheta] !== undefined) {
-                const customTheta = extras[ExtraKey.sublingualTheta];
-                if (typeof customTheta === 'number' && Number.isFinite(customTheta)) {
-                    theta = Math.min(1, Math.max(0, customTheta));
-                }
-            } else if (extras[ExtraKey.sublingualTier] !== undefined) {
-                const tierRaw = extras[ExtraKey.sublingualTier];
-                if (typeof tierRaw === 'number' && Number.isFinite(tierRaw)) {
-                    const tierIdx = Math.min(SL_TIER_ORDER.length - 1, Math.max(0, Math.round(tierRaw)));
-                    const tierKey = SL_TIER_ORDER[tierIdx] || 'standard';
-                    theta = _getSLTheta(tierKey);
-                }
-            }
-            const k1_fast = 2.4;
-            const k1_slow = 0.25;
-            const k2 = 0; // 生理修正：血液羧酸酯酶极速水解，无慢水解阻碍
-            const F_fast = toE2 * 0.28; // 组织再分布校准
+            const theta = _getSublingualNewTheta(extras);
+            const k1_fast = SublingualNewPK.kAbsFast;
+            const k1_slow = _getOralE2AbsorptionRate(event.ester);
+            // Rapid EV cleavage is folded into effective uptake, not assigned
+            // the injection depot's slow k2. EV-specific SL kinetics remain an
+            // extrapolation. All subsequent E2/E1/E1S rates are shared with oral.
+            const k2 = 0;
+            const F_fast = toE2 * SublingualNewPK.effectiveFastFraction;
             const F_slow = _activePKParams.e2_oral_bio * toE2;
             const F = theta * F_fast + (1 - theta) * F_slow;
-            return { Frac_fast: theta, k1_fast, k1_slow, k2, k3: defaultK3, F, rateMGh: 0, F_fast, F_slow };
+            return { Frac_fast: theta, k1_fast, k1_slow, k2, k3: defaultK3, F, rateMGh: 0, F_fast, F_slow,
+                metabolites: _getActiveE2Metabolites(),
+                oralInput: swallowedEstrogenInput(_activePKParams.e2_oral_bio, toE2) };
         }
 
         case Route.gel: {
@@ -1469,10 +1511,14 @@ function resolveParams(event: DoseEvent): PKParams {
             }
             // === 针对 CPA 的特殊处理结束 ===
 
-            const k1Value = event.ester === Ester.EV ? OralPK.kAbsEV : OralPK.kAbsE2;
+            const k1Value = _getOralE2AbsorptionRate(event.ester);
             const k2Value = event.ester === Ester.EV ? (EsterPK.k2[Ester.EV] || 0) : 0;
             const F = _activePKParams.e2_oral_bio * toE2;
-            return { Frac_fast: 1.0, k1_fast: k1Value, k1_slow: 0, k2: k2Value, k3: defaultK3, F, rateMGh: 0, F_fast: F, F_slow: F };
+            const hasMetabolites = event.ester === Ester.E2 || event.ester === Ester.EV;
+            return { Frac_fast: 1.0, k1_fast: k1Value, k1_slow: 0, k2: k2Value, k3: defaultK3, F, rateMGh: 0, F_fast: F, F_slow: F,
+                ...(hasMetabolites ? { metabolites: _getActiveE2Metabolites(),
+                    oralInput: swallowedEstrogenInput(_activePKParams.e2_oral_bio, toE2) } : {}) };
+
         }
     }
 
@@ -1617,12 +1663,25 @@ class PrecomputedEventModel {
                 };
                 break;
             case Route.gel:
-            case Route.oral:
                 this.model = (timeH: number) => {
                     const tau = timeH - startTime;
                     if (tau < 0) return 0;
                     return oneCompAmount(tau, dose, params);
                 };
+                break;
+            case Route.oral:
+                if (params.metabolites && params.oralInput) {
+                    const input = params.oralInput.map(value => value * dose) as unknown as EstrogenAmounts;
+                    const oral = params.metabolites.compileE2(params.k1_fast, input);
+                    this.model = timeH => oral(timeH - startTime);
+                } else {
+                    // CPA and other legacy oral implementations are unchanged.
+                    this.model = (timeH: number) => {
+                        const tau = timeH - startTime;
+                        if (tau < 0) return 0;
+                        return oneCompAmount(tau, dose, params);
+                    };
+                }
                 break;
             case Route.sublingual:
                 this.model = (timeH: number) => {
@@ -1642,19 +1701,15 @@ class PrecomputedEventModel {
                     return fastAmount + slowAmount;
                 };
                 break;
-            case Route.sublingualNew:
-                this.model = (timeH: number) => {
-                    const tau = timeH - startTime;
-                    if (tau < 0) return 0;
-                    const doseF = dose * params.Frac_fast;
-                    const doseS = dose * (1.0 - params.Frac_fast);
-
-                    const fastAmount = _analytic2C(tau, doseF, params.F_fast, params.k1_fast, params.k3);
-                    const slowAmount = _analytic2C(tau, doseS, params.F_slow, params.k1_slow, 0.12);
-
-                    return fastAmount + slowAmount;
-                };
+            case Route.sublingualNew: {
+                const profile = params.metabolites!;
+                const fast = profile.compileE2(params.k1_fast, [dose * params.Frac_fast * params.F_fast, 0, 0]);
+                const input = params.oralInput!.map(value => value * dose * (1 - params.Frac_fast)) as unknown as EstrogenAmounts;
+                const swallowed = profile.compileE2(params.k1_slow, input);
+                // Only regenerated E2 is counted: E1/E1S are not E2 by weight.
+                this.model = timeH => fast(timeH - startTime) + swallowed(timeH - startTime);
                 break;
+            }
             case Route.patchApply:
                 const wearH = resolvePatchWearH(event, allEvents);
 
@@ -1694,10 +1749,10 @@ class PrecomputedEventModel {
 
 /**
  * Compute the maximum time (hours after dose) for which an event's PK model
- * contribution is non-negligible.  Once tau > maxLifetimeH the exponential
- * decay has reduced the amount to < 1e-6 of its peak, so we can safely skip
- * the evaluation — critical when there are hundreds of events (e.g. daily
- * oral recording for a year).
+ * contribution is non-negligible. This exponential-tail heuristic avoids
+ * evaluating long-decayed doses when there are hundreds of recorded events.
+ * Revised SL includes extra headroom for Bateman prefactors; the cutoff is a
+ * numerical approximation, not a physiological zero or assay detection limit.
  */
 function computeMaxLifetimeH(params: PKParams, route: Route, allEvents: DoseEvent[], eventTimeH: number): number {
     // For patches: account for wear duration + post-removal decay. The apply
@@ -1716,13 +1771,17 @@ function computeMaxLifetimeH(params: PKParams, route: Route, allEvents: DoseEven
     if (params.k1_slow > 0) rates.push(params.k1_slow);
     if (params.k2 > 0) rates.push(params.k2);
     if (params.k3 > 0) rates.push(params.k3);
+    if (params.metabolites) rates.push(...params.metabolites.decayRates);
 
     if (rates.length === 0) return Infinity;
 
-    // The slowest exponential dominates at large tau.
-    // exp(-kMin * tau) < 1e-6  =>  tau > ln(1e6) / kMin ≈ 13.816 / kMin
+    // Include the slow network eigenmode, not just disappearance of E2 from
+    // its own pool. Reversible metabolite return can outlast both absorption
+    // and the early fall. Extra numerical headroom covers convolution
+    // prefactors; this cutoff is NOT a physiological disappearance time.
     const kMin = Math.min(...rates);
-    return Math.ceil(13.816 / kMin);
+    const tailExponent = params.metabolites ? Math.log(1e10) : (route === Route.sublingualNew ? Math.log(1e8) : 13.816);
+    return Math.ceil(tailExponent / kMin);
 }
 
 export function runSimulation(events: DoseEvent[], bodyWeightKG: number): SimulationResult | null {
@@ -1739,7 +1798,7 @@ export function runSimulation(events: DoseEvent[], bodyWeightKG: number): Simula
             const model = new PrecomputedEventModel(e, sortedEvents);
             const params = resolveParams(e);
             const maxLifetimeH = computeMaxLifetimeH(params, e.route, sortedEvents, e.timeH);
-            return { model, ester: e.ester, startTimeH: e.timeH, maxLifetimeH };
+            return { model, route: e.route, ester: e.ester, startTimeH: e.timeH, maxLifetimeH };
         });
 
     const startTime = sortedEvents[0].timeH - 24;
@@ -1773,16 +1832,16 @@ export function runSimulation(events: DoseEvent[], bodyWeightKG: number): Simula
     const stepSize = (endTime - startTime) / (steps - 1);
     const gridTimes = Array.from({ length: steps }, (_, i) => startTime + i * stepSize);
 
-    // Add dense peri-event sampling points around each dose event for better peak/trough capture.
-    // Only add for events whose contribution is still active at endTime to avoid O(n) blowup
-    // with hundreds of events (e.g. daily recording for a year).
+    // Preserve peaks in the WHOLE displayed history, not only doses still active
+    // at the far-future horizon. With a +14-day horizon the old endTime check
+    // dropped even today's E2 sublingual peri-dose samples, flattening sharp peaks.
+    // Offset count is bounded per event; old events still need their local peak.
     const periEventOffsets = [0.25, 0.5, 1, 2, 4, 6, 8, 12, 24, 48];
+    const sublingualNewOffsets = [0.125, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8, 12, 24, 48];
     const periEventTimes: number[] = [];
     for (const pc of precomputed) {
-        // Skip peri-event sampling for events whose contribution has fully decayed;
-        // their curves are smooth/zero and don't need dense peak capture.
-        if (pc.maxLifetimeH !== Infinity && endTime - pc.startTimeH > 2 * pc.maxLifetimeH) continue;
-        for (const offset of periEventOffsets) {
+        const offsets = pc.route === Route.sublingualNew ? sublingualNewOffsets : periEventOffsets;
+        for (const offset of offsets) {
             const t = pc.startTimeH + offset;
             if (t >= startTime && t <= endTime) {
                 periEventTimes.push(t);

@@ -8,6 +8,7 @@
     "build": "vite build",
     "build:watch": "vite build --watch",
     "test:auth-ui": "node scripts/test_sensitive_auth_ui.mjs",
+    "test:pk": "node --test scripts/test_pk_sublingual.mjs",
     "preview": "vite preview",
     "wrangler:dev": "npm run build && wrangler dev",
     "wrangler:migrate:local": "wrangler d1 migrations apply hrt-tracker-prod --local",

@@ -56,6 +56,13 @@ const SublingualFields: React.FC<SublingualFieldsProps> = ({
 
     return (
         <div className="space-y-4">
+            {route === Route.sublingualNew && (
+                <div className="space-y-1 text-xs text-[var(--text-muted)]" role="note">
+                    <p>{t('sl.new_model_note')}</p>
+                    <p>{t('sl.metabolite_note')}</p>
+                    {ester === Ester.EV && <p>{t('sl.new_ev_note')}</p>}
+                </div>
+            )}
             <div className="space-y-3">
                 <div className="flex justify-between items-center">
                     <label className="block text-xs font-semibold text-[var(--text-muted)] pl-1">{t('field.sl_absorption')}</label>

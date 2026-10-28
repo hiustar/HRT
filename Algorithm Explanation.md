@@ -2,6 +2,8 @@
 
 This README explains the algorithms used for each drug/route, key parameters and units, what was tuned, why we tuned it, and how the implementation evolved.
 
+> **2026-10-27 / canary 更新**：§6 已按当前 TypeScript 舌下实现重写；新版模型的研究依据、参数先验、前后对照及限制见 [舌下模型审查](docs/sublingual-model-review.md)。其他章节含历史实现记录，不代表所有参数已获临床验证。
+
 ---
 
 ## 0) 总览（模型架构）
@@ -13,8 +15,8 @@ This README explains the algorithms used for each drug/route, key parameters and
 - **ParameterResolver**：把事件映射为具体参数 `PKParams`（k₁/k₂/k₃、F、双库或双通路比例、零阶速率等）。
 - **ThreeCompartmentModel**：解析解工具箱：
   - 三室模型（首过吸收 k₁ → 酯水解 k₂ → 游离 E2 清除 k₃）的解析式。
-  - 单室 Bateman 形式（口服/凝胶简化）。
-  - 双通路舌下模型（快：口腔黏膜；慢：吞咽 = 口服；**E2: dualAbsAmount；EV: dualAbs3CAmount**）。
+  - 单室 Bateman 形式（凝胶及部分旧实现）；口服 E2/EV 及新版舌下采用 E2/E1/E1S 网络卷积（§6）。
+  - 双通路舌下模型（快：口腔黏膜；慢：吞咽口服；旧版与新版的 E2/EV 实现分别见 §6）。
   - 贴片：零阶输入在佩戴窗口内，移除后按 k₃ 衰减；或旧版一阶“假库”。
 - **SimulationEngine**：把一堆 `DoseEvent` 预编译为时间→量的函数，遍历时间点，线性叠加各事件的中心室药量，再以体分布换算为浓度，AUC 用梯形法则积分。
 
@@ -22,7 +24,7 @@ This README explains the algorithms used for each drug/route, key parameters and
 - 剂量 `doseMG` 以 mg 计；中心室药量计算单位也是 mg。
 - 浓度输出为 pg/mL：`conc = amountMG × 1e9 / Vd_ml`。
 - 体分布体积：`Vd = vdPerKG × BW`，其中 `vdPerKG` 默认 **2.0 L·kg⁻¹**（可在设置中调整）。
-- **输入剂量均已按 E2 等效（E2‑eq）换算**；因此各路由的 `F` 不再乘以分子量换算因子。 `EsterInfo.toE2Factor` 仅用于显示/对照，不参与计算。
+- **当前 TypeScript 的 `doseMG` 是原药/酯剂量（mg），不是预先换算的 E2 等效剂量**；雌二醇路由在 `F` 中乘以分子量换算因子一次，避免重复折算。
 
 ---
 
@@ -145,94 +147,67 @@ This README explains the algorithms used for each drug/route, key parameters and
 
 ## 5) 口服（E2/EV）
 
-### 5.1 模型与参数
-- **模型**：单室 Bateman 吸收–清除。**EV 的水解效应已折叠进更小的 `kAbsEV`，不单独建 `k₂`。**
-- **默认参数**：  
-  `kAbsE2 = 0.32 h⁻¹`（E2 片，`Tmax ≈ 2–3 h`）。  
-  `kAbsEV = 0.05 h⁻¹`（EV 片，`Tmax ≈ 6–7 h`）。  
-  `bioavailability = 0.03`（口服首过后系统暴露，E2 与 EV 近似相同量级）。  
+### 5.1 当前模型与参数
 
-### 5.2 调参说明
-- `F = 0.03` 体现了口服首过代谢的强烈损耗；与常见文献 2–5% 的数量级一致。
-- `kAbs` 调整使曲线在 2–7 小时区间达到合理峰位。
+口服 E2/EV 使用 §6 的 E2/E1/E1S 三池网络，以 theta=0 计算。EV 的有效吸收仍为
+`kAbsEV=0.05 h⁻¹`，E2 为 `kAbsE2=0.32 h⁻¹`；未另建酯水解室。
+这些是继承的简化参数，不能把它们当成经临床拟合的真实吸收/裂解速率。
 
----
+### 5.2 直接输入与总代谢物回补
 
-## 6) 舌下（E2/EV）
-
-### 6.1 模型与参数（路线图）
-- **双通路**：把剂量按分流系数 **θ** 分为两支：
-  - **快通路（口腔黏膜）**：$k_{1,\text{fast}} = k_{\text{SL}}$，**绕过首过**。本项目统一按**等效 E2(E2‑eq)**输入，因此快支 **$F_{\text{fast}}=1$**。
-  - **慢通路（吞咽→胃肠）**：$k_{1,\text{slow}} = k_{\text{Abs,E2/EV}}$，**进入首过**，**$F_{\text{slow}}=F_{\text{oral}}=0.03$**。
-- **EV 与 E2 的差异**：
-  - **舌下 E2**：无水解步（$k_2=0$），用单室 Bateman 对两支路叠加（`dualAbsAmount`）。
-  - **舌下 EV**：**进血后仍需水解为 E2**（$k_2=k_{2,\text{EV}}$），两支路均走「吸收 ($k_1$) → 水解 ($k_2$) → 清除 ($k_3$)」的三室解析式（`dualAbs3CAmount`）。
-  - **清除**：中心室游离 E2 的清除常数 $k_3 = 0.41\ \mathrm{h}^{-1}$（见§1），与贴片移除后回落节奏一致。
-
-### 6.2 黏膜分流 θ 的**行为建模**（取代早期 RF 反推法）
-早期文档用 $\theta=\frac{F_{\text{oral}}(RF-1)}{1-F_{\text{oral}}}$ 从相对生物利用度 RF 反推 θ。该做法只能匹配 **AUC 比例**，会误估 **峰值/达峰时间**，因此已弃用。
-
-我们显式建模**溶解**与**吞咽清除**，把口腔当作最小可用系统：
-- 固体剂量 ($S$) 以速率 $k_{\text{diss}}$ 溶到口腔液相 \(D\)；
-- 溶解相 ($D$) 面临两个竞争路径：**黏膜吸收** $(k_{\text{SL}})$ 与**吞咽清除** $(k_{\text{sw}})$。
-
-连立常微分方程（单位 h）：
-$$
-\begin{aligned}
-\frac{dS}{dt}&=-k_{\text{diss}}\,S\\
-\frac{dD}{dt}&=k_{\text{diss}}\,S-(k_{\text{SL}}+k_{\text{sw}})\,D
-\end{aligned}
-$$
-
-在用户的“含服窗口” $T_{\text{hold}}$ 内，**真正走黏膜**的比例定义为
-$$
-\boxed{\ \theta(T_{\text{hold}})=\frac{1}{\text{Dose}}\int_{0}^{T_{\text{hold}}} k_{\text{SL}}\,D(t)\,dt\ }
-$$
-超过 $T_{\text{hold}}$ 的残留（未吸收固体与溶解相）一律视为吞咽，进入口服通道（即我们的**慢支**）。
-
-**参数锚点与合理区间**
-- $k_{\text{SL}}$ 以**实测达峰**锚定：舌下 E2 常见 $T_{\max}\approx 1\ \mathrm{h}$。一室解析
-  $T_{\max}=\frac{\ln(k_a/k_e)}{k_a-k_e}$，代入 $k_e=k_3=0.41\ \mathrm{h}^{-1}$ 反推 $k_a\approx 1.8\text{–}2.0\ \mathrm{h}^{-1}$。本项目取 **$k_{\text{SL}}=1.8\ \mathrm{h}^{-1}$**。
-- $k_{\text{diss}}$：口腔制剂溶解/崩解的**分钟级**过程，经验半衰期选 **3/5/10 min** 三档（速崩/常规/偏慢），便于随配方微调。
-- $k_{\text{sw}}$：**有效**唾液清除率（非吞咽频次），经验区间 **0.8 / 1.8 / 3.0 h⁻¹** 代表低/中/高个体差异，后续可用外部数据回归精化。
-
-**计算实现**
-- App 内对上式做**数值积分**（固定步长 Δt≈3.6 s 的 Euler），得到 $\theta(T_{\text{hold}})$。
-- 为便于直观理解，我们也提供一个保守的闭式近似（作为上界/直觉，不用于核心计算）：
-
-$$
-\theta_{\text{eff}}\ \approx\ \frac{k_{\text{SL}}}{k_{\text{SL}}+k_{\text{sw}}}\Bigl(1-e^{-(k_{\text{SL}}+k_{\text{sw}})T_{\text{hold}}}\Bigr)\Bigl(1-e^{-k_{\text{diss}}T_{\text{hold}}}\Bigr)
-$$
-
-**UI 档位（不再使用 `theta_default`，用户必须选择一档）**  
-采用中档场景（$k_{\text{sw}}=1.8\ \mathrm{h}^{-1}$，溶解半衰期 5 min）计算，并给出跨场景范围作参考：
-
-| 档位 | 建议含服时长 | θ 推荐 | 典型范围（跨不同 $k_{\text{sw}}$/$k_{\text{diss}}$） |
-| --- | ---: | ---: | ---: |
-| Quick | ≈ 2 min | **0.01** | 0.004–0.012 |
-| Casual | ≈ 5 min | **0.04** | 0.021–0.057 |
-| Standard | ≈ 10 min | **0.11** | 0.064–0.156 |
-| Strict | ≈ 15 min | **0.18** | 0.115–0.253 |
-
-- UI 选择的档位直接映射为 \(\theta\) 并写入 `DoseEvent.extras[.sublingualTheta]`；**不再读取/依赖 `theta_default`**。
-
-**一致性校验（慢支=口服）**  
-当 $\theta=0$ 时，舌下模型**严格退化为口服**：慢支的 $k_{1,\text{slow}}$、$F_{\text{slow}}$、$k_2$、$k_3$ 与对应口服路由完全一致。在回归测试中对比了 “SL，$\theta=0$” 与 “Oral” 的整轨迹，差异 0。
-
-### 6.3 数学形式（实现对照）
-- **舌下 E2（无水解）**：两支路的一室 Bateman 叠加  
-  $$
-  A(t)=A_{\text{fast}}(t)+A_{\text{slow}}(t),\quad
-  A_{\text{branch}}(t)=\frac{F\,k_1}{k_1-k_3}\,\text{Dose}_{\text{branch}}\bigl(e^{-k_3 t}-e^{-k_1 t}\bigr)
-  $$
-- **舌下 EV（含水解）**：两支路的三室解析叠加  
-  $$
-  A(t)=A^{(3C)}_{\text{fast}}(t)+A^{(3C)}_{\text{slow}}(t),\quad
-  A^{(3C)}_{\text{branch}}(t)=\texttt{\_analytic3C}\bigl(t;\ \text{Dose}_{\text{branch}},F,k_1,k_{2,\text{EV}},k_3\bigr)
-  $$
-  其中 $\text{Dose}_{\text{fast}}=\theta\cdot\text{Dose},\ \text{Dose}_{\text{slow}}=(1-\theta)\cdot\text{Dose}$，且 $F_{\text{fast}}=1,\ F_{\text{slow}}=F_{\text{oral}}$。
+`e2_oral_bio=0.03` 表示直接 E2 输入系数，另外有 E1/E1S 首过输入及后续回转。
+因此它不再表示全部系统暴露。历史的单室 F/清除率校准不能直接继承其原有含义，
+也不能用当前模型重现某项口服研究的峰时或谷值，除非取得相应时序数据重新拟合。
 
 ---
+
+## 6) 舌下及口服 E2/EV：当前 TypeScript 实现（第二次修订）
+
+旧版 `Route.sublingual` 保留兼容；新版 `Route.sublingualNew` 与口服 E2/EV 共享
+**E2 ↔ E1 ↔ E1S** 的有效三池网络。完整资料、方程、先验、数值及限制见
+[2026-10-27 舌下模型审查](docs/sublingual-model-review.md)。这是机制启发近似，未完成临床拟合。
+
+### 6.1 吸收输入与回转
+
+```text
+x = [A2, A1, AS]ᵀ（均为 mg E2 摩尔等效量）
+x' = Mx + b_fast ka_fast exp(-ka_fast t) + b_slow ka_slow exp(-ka_slow t)
+M = [-ke,       0.06 ln2 * strength,       0]
+    [0.5 ke,   -ln2,                     0.21 ks * strength]
+    [0,         0.54 ln2,                -ks]
+ks = ln2 / sulfateHalfLifeH
+
+b_fast = D r theta [0.28, 0, 0]
+b_slow = D r (1-theta) [F, 0.1(1-F), 0.5(1-F)]
+Delta C_E2 = A2 * 1e9 / (2.0 * weightKg * 1000) pg/mL
+```
+
+- `r=1`（E2）或 `272.38/356.50`（EV），只换算一次；口服为 theta=0。
+- 快吸收 `ka=2.4 h⁻¹`，吞咽吸收 E2 `0.32`、EV `0.05 h⁻¹`，沿用经验参数。
+- `ke=e2_kClear` 默认 0.41 h⁻¹ 是 E2 池总消失率，其中部分进入 E1，不再把全部消失视为永不返回。
+- `strength=e2_recycle_strength` 默认 1、敏感性区间 0–3；0 关闭对 E2 的回补。
+- `sulfateHalfLifeH=e2_sulfate_halfLifeH` 默认 12 h、敏感性区间 4–36 h，**不是已验证的人体范围或 E2 终末半衰期**。
+- 所有分支比例和周转均为待拟合先验，不能将文献 tracer transfer factors 当作 h⁻¹ 或单次分支比例。默认 E1 周转先验为 1 h。
+- E1/E1S 不直接加到 E2 浓度，只通过回转增加 A2。其他结合物和流出折叠处理，未显式拟合肠肝延迟或组织多室。
+- `F=e2_oral_bio` 默认 0.03 现在指直接 E2 输入，不是回转后的总暴露；旧的个体校准需重新核对。
+- AUC 药量积分为 `first_component(-M^-1(b_fast+b_slow))`，不能使用旧的 `D*F/ke`。
+- EV 快支折叠快速酯裂解，不使用注射慢水解参数；EV 舌下仍缺少直接数据。
+
+### 6.2 档位与叠加
+
+`theta` 读取自定义分流或档位，默认档位 0.01/0.04/0.11/0.18，仅为兼容的经验权重，不是含服分钟数实测的吸收比例。
+新版 theta=0 与本轮口服整轨迹严格重合。重复给药叠加各次完整网络响应，储库残余自然累积；不重复添加任意基础值。
+
+### 6.3 旧版兼容
+
+旧版 E2 继续用 `dualAbsAmount`，旧版 EV 继续用含酯水解的 `dualAbs3CAmount`；不把本轮网络或新参数悄悄应用到旧路由。其他激素、注射、凝胶及贴片内核未改。
+
+### 6.4 求解、采样和数值截尾
+
+三池网络用对称变换、Jacobi 特征分解及解析吸收卷积，按参数缓存；相等速率用连续极限。
+生命周期纳入最慢网络模态，并用 `ln(1e10)/min(rate)` 留数值余量，无 8/24 h 强制归零。
+所有历史剂量保留峰值附近采样，新版增加 0.125/0.75/1.25/1.5/3 h 等点，不受末端 14 天预测窗干扰。
+自动验证入口：`node --test scripts/test_pk_sublingual.mjs`。独立数值算法和回归测试仅验证实现，不等于临床有效性。
 
 ## 7) AUC 计算与稳态
 - **AUC**：在 `SimulationEngine` 中对已合成的浓度轨迹采用梯形法积分得到（单位 `pg·h/mL`）。
@@ -321,7 +296,7 @@ $$
 - 个体差异未建模：肝功能、SHBG、年龄、体脂、并用药等可能改变 `F` 与各速率常数。
 - 凝胶的面积/负荷非线性：当前未在模型中体现；存在低剂量低估与高剂量高估的潜在风险。
 - 注射溶剂/体积影响：对扩散 `k₁` 的影响尚未显式参数化，现仅可用全局系数 `depotK1Corr` 近似。
-- 口服/舌下仅建模游离 E2：雌酮及其硫酸酯的储库效应未纳入。
+- 口服 E2/EV 及新版舌下已含 E1/E1S 有效三池，但回转和首过分配仍是未临床拟合的先验；旧版舌下未纳入，其他结合物、肠肝延迟和组织分布未显式表示。
 - AUC 的跨路由可比性有限：参数含经验缩放，AUC 适合于相同路由内的相对比较与个体内优化。
 
 ---
@@ -334,17 +309,17 @@ $$
 | 贴片（零阶） | 解析 | µg/day → mg/h | 零阶恒速输入 + k₃ 清除；移除后指数衰减 | `rateMGh, k3` | 固定 1.0 |
 | 贴片（一阶遗留） | 解析 | mg | 一阶“假库” + k₃ 清除；移除时截断 | `k1, k3` | 固定 1.0 |
 | 凝胶 | 解析 | mg（+面积 cm²） | 单室 Bateman（临时常量版） | `k1 = 0.022, F = 0.05, k3` | 常量 0.05 |
-| 口服 E2 | 解析 | mg | 单室 Bateman | `kAbsE2 = 0.32, F = 0.03, k3` | 常量 0.03 |
-| 口服 EV | 解析 | mg | 单室 Bateman | `kAbsEV = 0.05, F = 0.03, k3` | 常量 0.03 |
-| 舌下 E2/EV | 解析 | mg（等效 E2） | 双通路：快 = 黏膜、慢 = 吞咽→口服；**E2 用一室（dualAbsAmount），EV 用三室（dualAbs3CAmount）** | `θ` 来自 UI 档位（Quick/5/10/15 分钟映射）；`kAbsSL=1.8`，`kAbsE2/EV`，`k2(EV)`，`k3` | 快 1.0；慢 `F_oral=0.03` |
+| 口服 E2 | 解析网络卷积 | mg | E2/E1/E1S 三池 | `ka=0.32`，回转参数见 §6 | 0.03 为直接 E2 输入系数，不是总暴露 |
+| 口服 EV | 解析网络卷积 | mg（分子量换算一次） | E2/E1/E1S 三池 | `ka=0.05`，仍需复核 | 0.03 为直接 E2 输入系数，不是总暴露 |
+| 舌下 E2/EV | 解析 | mg（原药/酯，F 内换算） | 旧版见 §6.3；新版双吸收输入共享 E2/E1/E1S 三池 | 新版快 `ka=2.4`；慢与口服相同；`theta` 为经验档位 | 新版快 `0.28 × MW因子`；慢含 E2/E1/E1S 输入，详见 §6；非临床验证 |
 
 ---
 
 ## 12) 实现细节摘抄
 - **PrecomputedEventModel**：
   - 注射：`injAmount(tau, dose, p)`
-  - 凝胶/口服：`oneCompAmount(tau, dose, p)`（把 `k1_fast` 视作该路由的 `ka`）
-  - 舌下：`dualAbsAmount(tau, dose, p)`（`Frac_fast = θ`，`F_fast` 与 `F_slow` 可分配）
+  - 凝胶和其他口服：`oneCompAmount(tau, dose, p)`；口服 E2/EV 使用三池 `compileE2` 卷积。
+  - 旧版舌下：`dualAbsAmount` / `dualAbs3CAmount`；新版：快/慢输入分别编译到同一个三池响应。
 - **贴片**：
   - 找到紧随的 `patchRemove` 决定 `wearH`。
   - 零阶：佩戴内 `rateMGh/k3 × (1 − e^{−k3 t})`；移除后按 `e^{−k3 Δt}` 衰减。

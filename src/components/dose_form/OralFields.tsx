@@ -25,6 +25,9 @@ const OralFields: React.FC<OralFieldsProps> = ({
 
     return (
         <div className="grid grid-cols-2 gap-4">
+            {(ester === Ester.E2 || ester === Ester.EV) && (
+                <p className="col-span-2 text-xs text-[var(--text-muted)]" role="note">{t('sl.metabolite_note')}</p>
+            )}
             {(ester !== Ester.E2) && (
                 <div className={`space-y-1.5 ${(ester === Ester.EV && route === Route.oral) || rawOnly ? 'col-span-2' : ''}`}>
                     <label className="block text-xs font-semibold text-[var(--text-muted)] pl-1">{t('field.dose_raw')}</label>

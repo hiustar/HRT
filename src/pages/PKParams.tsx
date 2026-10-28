@@ -40,6 +40,8 @@ const SECTIONS: { key: SectionKey; titleKey: string; fields: FieldDef[] }[] = [
         titleKey: 'pk.group.e2_oral_sl',
         fields: [
             { key: 'e2_oral_bio', labelKey: 'pk.e2_oral_bio', min: 0, max: 1, step: 0.001, precision: 4 },
+            { key: 'e2_recycle_strength', labelKey: 'pk.e2_recycle_strength', min: 0, max: 3, step: 0.1, precision: 2 },
+            { key: 'e2_sulfate_halfLifeH', labelKey: 'pk.e2_sulfate_halfLifeH', min: 4, max: 36, step: 1, precision: 1 },
             { key: 'e2_sl_quick', labelKey: 'pk.sl_theta.quick', min: 0, max: 1, step: 0.001, precision: 4 },
             { key: 'e2_sl_casual', labelKey: 'pk.sl_theta.casual', min: 0, max: 1, step: 0.001, precision: 4 },
             { key: 'e2_sl_standard', labelKey: 'pk.sl_theta.standard', min: 0, max: 1, step: 0.001, precision: 4 },
@@ -164,6 +166,11 @@ const PKParamsPage: React.FC<PKParamsPageProps> = ({ pkParams, onSave, onReset, 
 
                         <div className="disclosure" data-open={openSections.has(section.key)}>
                             <div className="disclosure-inner">
+                                {section.key === 'e2_oral_sl' && (
+                                    <p className="py-3 text-xs text-[var(--text-muted)]" role="note">
+                                        {t('sl.metabolite_note')}
+                                    </p>
+                                )}
                                 {section.fields.map(field => {
                                     const defVal = DEFAULT_PK_PARAMS[field.key] as number;
                                     const curVal = draft[field.key] as number;
