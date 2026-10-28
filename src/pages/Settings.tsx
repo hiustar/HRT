@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useId, useState } from 'react';
 import { ChevronRight, Settings2, Database, Info } from 'lucide-react';
 import { Lang } from '../i18n/translations';
 import { AppTheme } from '../constants';
@@ -87,6 +87,44 @@ const SwitchRow: React.FC<{ label: string; desc: string; checked: boolean; onCha
     </div>
 );
 
+const SublingualModelPicker: React.FC<{
+    t: SettingsProps['t'];
+    value: SublingualModel;
+    onChange: (model: SublingualModel) => void;
+}> = ({ t, value, onChange }) => {
+    // Mobile and desktop settings can both be mounted; each needs its own
+    // native radio group so keyboard selection stays within the visible one.
+    const id = useId();
+    return (
+        <div className="py-3.5">
+            <p id={`${id}-label`} className={rowLabel}>{t('settings.sublingual_model')}</p>
+            <div
+                role="radiogroup"
+                aria-labelledby={`${id}-label`}
+                aria-describedby={`${id}-description`}
+                className="mt-3 grid grid-cols-3 gap-1 rounded-[var(--radius-md)] bg-[var(--surface-muted)] p-1"
+            >
+                {SUBLINGUAL_MODELS.map(model => (
+                    <label key={model} className="relative min-w-0 cursor-pointer">
+                        <input
+                            type="radio"
+                            name={`${id}-model`}
+                            value={model}
+                            checked={value === model}
+                            onChange={() => onChange(model)}
+                            className="peer sr-only"
+                        />
+                        <span className="flex h-full min-h-11 items-center justify-center rounded-[var(--radius-sm)] px-2 py-2 text-center text-[0.8125rem] font-medium leading-snug text-[var(--text-muted)] break-words transition-colors hover:text-[var(--text)] peer-checked:bg-[var(--control-thumb)] peer-checked:font-semibold peer-checked:text-[var(--text)] peer-checked:shadow-[var(--shadow-xs)] peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent-ink)] motion-reduce:transition-none">
+                            {t(`settings.sublingual_model.${model}`)}
+                        </span>
+                    </label>
+                ))}
+            </div>
+            <p id={`${id}-description`} className={`mt-2 text-xs leading-relaxed ${muted}`}>{t('settings.sublingual_model_desc')}</p>
+        </div>
+    );
+};
+
 // Hard stops rather than a smooth blend, in equal fifths — the flag's stripes
 // are even, and anything else reads as a lopsided swatch.
 const CAT_STYLE_SWATCHES: { id: CatStyle; background: string }[] = [
@@ -169,21 +207,11 @@ const Settings: React.FC<SettingsProps> = ({
                     onClick={() => navTo(onNavigateToWeight, 'general')}
                 />
                 {mode === 'transfem' && (
-                    <div className="py-3.5">
-                        <label className="flex items-center justify-between gap-4">
-                            <span className={rowLabel}>{t('settings.sublingual_model')}</span>
-                            <select
-                                className="min-h-[44px] max-w-[55%] rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--field)] px-3 text-[0.9375rem] text-[var(--text)] focus:border-[var(--accent-ink)]"
-                                value={normalizeSublingualModel(pkParams?.sublingualModel)}
-                                onChange={e => onSublingualModelChange(normalizeSublingualModel(e.target.value))}
-                            >
-                                {SUBLINGUAL_MODELS.map(model => (
-                                    <option key={model} value={model}>{t(`settings.sublingual_model.${model}`)}</option>
-                                ))}
-                            </select>
-                        </label>
-                        <p className={`text-xs ${muted} mt-1`}>{t('settings.sublingual_model_desc')}</p>
-                    </div>
+                    <SublingualModelPicker
+                        t={t}
+                        value={normalizeSublingualModel(pkParams?.sublingualModel)}
+                        onChange={onSublingualModelChange}
+                    />
                 )}
                 <NavRow
                     label={t('settings.pk_params')}

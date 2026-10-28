@@ -57,21 +57,21 @@ test('settings offers exactly three models between weight and parameter editing'
     const view = render(React.createElement(Settings, props({ pkParams: initial,
         onSublingualModelChange: value => { selected = { ...DEFAULT_PK_PARAMS, ...selected, sublingualModel: value }; },
     })));
-    const select = view.getByRole('combobox', { name: t('settings.sublingual_model') });
-    assert.deepEqual([...select.options].map(o => o.value), ['legacy', 'new', 'metabolite']);
-    assert.equal(select.value, 'metabolite');
+    const group = view.getByRole('radiogroup', { name: t('settings.sublingual_model') });
+    assert.deepEqual(view.getAllByRole('radio').map(o => o.value), ['legacy', 'new', 'metabolite']);
+    assert.equal(view.getByRole('radio', { checked: true }).value, 'metabolite');
     const weight = view.getByRole('button', { name: /体重.*70 kg/ });
     const params = view.getByRole('button', { name: /编辑参数/ });
-    assert.ok(weight.compareDocumentPosition(select) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING);
-    assert.ok(select.compareDocumentPosition(params) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING);
+    assert.ok(weight.compareDocumentPosition(group) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING);
+    assert.ok(group.compareDocumentPosition(params) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING);
     for (const value of ['legacy', 'new', 'metabolite']) {
-        fireEvent.change(select, { target: { value } });
+        fireEvent.click(view.getByRole('radio', { name: t(`settings.sublingual_model.${value}`) }));
         assert.equal(selected.sublingualModel, value);
         assert.equal(selected.e2_kClear, 0.6);
         view.rerender(React.createElement(Settings, props({ pkParams: selected,
             onSublingualModelChange: v => { selected = { ...selected, sublingualModel: v }; },
         })));
-        assert.equal(view.getByRole('combobox').value, value);
+        assert.equal(view.getByRole('radio', { checked: true }).value, value);
     }
     cleanup();
 });
@@ -79,7 +79,7 @@ test('settings offers exactly three models between weight and parameter editing'
 test('transmasc settings omit the estradiol sublingual model control', () => {
     globalThis.__slMode = 'transmasc';
     const view = render(React.createElement(Settings, props()));
-    assert.equal(view.queryByRole('combobox', { name: t('settings.sublingual_model') }), null);
+    assert.equal(view.queryByRole('radiogroup', { name: t('settings.sublingual_model') }), null);
     cleanup(); globalThis.__slMode = 'transfem';
 });
 
