@@ -9,12 +9,31 @@ import {
 
 export enum Route {
     sublingual = "sublingual",
-    sublingualNew = "sublingualNew",
     injection = "injection",
     patchApply = "patchApply",
     patchRemove = "patchRemove",
     gel = "gel",
     oral = "oral"
+}
+
+/** Accept historical route names at every read boundary; writes use one route. */
+export function normalizeRoute(raw: unknown): Route | null {
+    if (raw === 'sublingualNew') return Route.sublingual;
+    return Object.values(Route).includes(raw as Route) ? raw as Route : null;
+}
+
+/** Rename only the route, without mutating the source or stamping a user edit. */
+export function normalizeSublingualRecord<T>(record: T): T {
+    if (record && typeof record === 'object' && 'route' in record && record.route === 'sublingualNew') {
+        return { ...record, route: Route.sublingual };
+    }
+    return record;
+}
+
+export const SUBLINGUAL_MODELS = ['legacy', 'new', 'metabolite'] as const;
+export type SublingualModel = typeof SUBLINGUAL_MODELS[number];
+export function normalizeSublingualModel(raw: unknown): SublingualModel {
+    return SUBLINGUAL_MODELS.includes(raw as SublingualModel) ? raw as SublingualModel : 'metabolite';
 }
 
 export enum Ester {
@@ -188,7 +207,7 @@ const DOSE_CEILING = {
 } as const;
 
 const _isDailyRoute = (r: Route) =>
-    r === Route.oral || r === Route.sublingual || r === Route.sublingualNew || r === Route.gel || r === Route.patchApply;
+    r === Route.oral || normalizeRoute(r) === Route.sublingual || r === Route.gel || r === Route.patchApply;
 
 /**
  * Largest single-day total dose (mg) within the trailing `days` window for events
@@ -1001,6 +1020,8 @@ export const SublingualTierParams = {
 // --- PK Custom Parameters ---
 
 export interface PKCustomParams {
+    // Global algorithm selection; the logged route always remains sublingual.
+    sublingualModel?: SublingualModel;
     // E2 elimination rates
     e2_kClear: number;       // non-injection h⁻¹ (default: 0.41)
     e2_kClearInj: number;    // injection h⁻¹ (default: 0.041)
@@ -1037,6 +1058,7 @@ export interface PKCustomParams {
 }
 
 export const DEFAULT_PK_PARAMS: PKCustomParams = {
+    sublingualModel: 'metabolite',
     e2_kClear: 0.41,
     e2_kClearInj: 0.041,
     e2_ff_EB: 0.1092,
@@ -1122,7 +1144,8 @@ export function isPlausibleBodyWeightKG(kg: number): boolean {
  * not the only writer: an imported backup file can carry a `pkParams` block too,
  * and that path had no validation at all.
  */
-export const PK_PARAM_RANGES: Record<keyof PKCustomParams, readonly [number, number]> = {
+export type PKNumericParam = Exclude<keyof PKCustomParams, 'sublingualModel'>;
+export const PK_PARAM_RANGES: Record<PKNumericParam, readonly [number, number]> = {
     e2_kClear: [0.001, 5],
     e2_kClearInj: [0.001, 1],
     e2_ff_EB: [0, 1],
@@ -1163,12 +1186,16 @@ export function sanitizePKParams(raw: unknown): PKCustomParams | null {
     const src = raw as Record<string, unknown>;
     const out: PKCustomParams = { ...DEFAULT_PK_PARAMS };
     let recognised = 0;
-    for (const key of Object.keys(PK_PARAM_RANGES) as (keyof PKCustomParams)[]) {
+    for (const key of Object.keys(PK_PARAM_RANGES) as PKNumericParam[]) {
         if (!(key in src)) continue;
         const value = Number(src[key]);
         if (!Number.isFinite(value)) continue;
         const [min, max] = PK_PARAM_RANGES[key];
         out[key] = Math.min(max, Math.max(min, value));
+        recognised++;
+    }
+    if (SUBLINGUAL_MODELS.includes(src.sublingualModel as SublingualModel)) {
+        out.sublingualModel = src.sublingualModel as SublingualModel;
         recognised++;
     }
     return recognised > 0 ? out : null;
@@ -1187,6 +1214,10 @@ export function applyPKOverrides(params: PKCustomParams | null): void {
 /** Snapshot of the currently-active (merged) PK parameters. */
 export function getActivePKParams(): PKCustomParams {
     return { ..._activePKParams };
+}
+
+export function getActiveSublingualModel(): SublingualModel {
+    return normalizeSublingualModel(_activePKParams.sublingualModel);
 }
 
 /**
@@ -1283,6 +1314,7 @@ export function getBioavailabilityMultiplier(
     ester: Ester,
     extras: Partial<Record<ExtraKey, number>> = {}
 ): number {
+    route = normalizeRoute(route) ?? route;
     const mwFactor = getToE2Factor(ester);
 
     // Transmasculine (testosterone) path
@@ -1314,22 +1346,9 @@ export function getBioavailabilityMultiplier(
         case Route.oral:
             return _activePKParams.e2_oral_bio * mwFactor;
         case Route.sublingual: {
-            let theta = _activePKParams.e2_sl_standard;
-            if (extras[ExtraKey.sublingualTheta] !== undefined) {
-                const customTheta = extras[ExtraKey.sublingualTheta];
-                if (typeof customTheta === 'number' && Number.isFinite(customTheta)) {
-                    theta = Math.min(1, Math.max(0, customTheta));
-                }
-            } else if (extras[ExtraKey.sublingualTier] !== undefined) {
-                const tierIdx = Math.min(SL_TIER_ORDER.length - 1, Math.max(0, Math.round(extras[ExtraKey.sublingualTier]!)));
-                const tierKey = SL_TIER_ORDER[tierIdx] || 'standard';
-                theta = _getSLTheta(tierKey);
-            }
-            return (theta + (1 - theta) * _activePKParams.e2_oral_bio) * mwFactor;
-        }
-        case Route.sublingualNew: {
             const theta = _getSublingualNewTheta(extras);
-            return (theta * SublingualNewPK.effectiveFastFraction + (1 - theta) * _activePKParams.e2_oral_bio) * mwFactor;
+            const fastFraction = getActiveSublingualModel() === 'legacy' ? 1 : SublingualNewPK.effectiveFastFraction;
+            return (theta * fastFraction + (1 - theta) * _activePKParams.e2_oral_bio) * mwFactor;
         }
         case Route.gel: {
             const siteIdx = Math.min(GEL_SITE_ORDER.length - 1, Math.max(0, Math.round(extras[ExtraKey.gelSite] ?? 0)));
@@ -1357,12 +1376,14 @@ interface PKParams {
     rateMGh: number;
     F_fast: number;
     F_slow: number;
+    k3_slow?: number; // Original new-SL branch used its own effective decay.
     // Oral E2/EV and revised SL share this snapshot. Legacy routes stay frozen.
     metabolites?: EstrogenMetaboliteProfile;
     oralInput?: EstrogenAmounts; // E2/E1/E1S molar-equivalent input per mg dose
 }
 
 function resolveParams(event: DoseEvent): PKParams {
+    event = normalizeSublingualRecord(event);
     const defaultK3 = event.route === Route.injection ? _activePKParams.e2_kClearInj : _activePKParams.e2_kClear;
     const toE2 = getToE2Factor(event.ester);
     const extras = event.extras ?? {};
@@ -1417,32 +1438,17 @@ function resolveParams(event: DoseEvent): PKParams {
         }
 
         case Route.sublingual: {
-            let theta = _activePKParams.e2_sl_standard;
-            if (extras[ExtraKey.sublingualTheta] !== undefined) {
-                const customTheta = extras[ExtraKey.sublingualTheta];
-                if (typeof customTheta === 'number' && Number.isFinite(customTheta)) {
-                    theta = Math.min(1, Math.max(0, customTheta));
-                }
-            } else if (extras[ExtraKey.sublingualTier] !== undefined) {
-                const tierRaw = extras[ExtraKey.sublingualTier];
-                if (typeof tierRaw === 'number' && Number.isFinite(tierRaw)) {
-                    const tierIdx = Math.min(SL_TIER_ORDER.length - 1, Math.max(0, Math.round(tierRaw)));
-                    const tierKey = SL_TIER_ORDER[tierIdx] || 'standard';
-                    theta = _getSLTheta(tierKey);
-                }
-            }
-            const k1_fast = OralPK.kAbsSL;
-            const k1_slow = event.ester === Ester.EV ? OralPK.kAbsEV : OralPK.kAbsE2;
-            const k2 = EsterPK.k2[event.ester] ?? 0;
-            const F_fast = toE2;
-            const F_slow = _activePKParams.e2_oral_bio * toE2;
-            const F = theta * F_fast + (1 - theta) * F_slow;
-            return { Frac_fast: theta, k1_fast, k1_slow, k2, k3: defaultK3, F, rateMGh: 0, F_fast, F_slow };
-        }
-        case Route.sublingualNew: {
             const theta = _getSublingualNewTheta(extras);
+            const selection = getActiveSublingualModel();
+            if (selection === 'legacy') {
+                const F_fast = toE2;
+                const F_slow = _activePKParams.e2_oral_bio * toE2;
+                return { Frac_fast: theta, k1_fast: OralPK.kAbsSL,
+                    k1_slow: _getOralE2AbsorptionRate(event.ester), k2: EsterPK.k2[event.ester] ?? 0,
+                    k3: defaultK3, F: theta * F_fast + (1 - theta) * F_slow, rateMGh: 0, F_fast, F_slow };
+            }
             const k1_fast = SublingualNewPK.kAbsFast;
-            const k1_slow = _getOralE2AbsorptionRate(event.ester);
+            const k1_slow = selection === 'new' ? 0.25 : _getOralE2AbsorptionRate(event.ester);
             // Rapid EV cleavage is folded into effective uptake, not assigned
             // the injection depot's slow k2. EV-specific SL kinetics remain an
             // extrapolation. All subsequent E2/E1/E1S rates are shared with oral.
@@ -1450,6 +1456,12 @@ function resolveParams(event: DoseEvent): PKParams {
             const F_fast = toE2 * SublingualNewPK.effectiveFastFraction;
             const F_slow = _activePKParams.e2_oral_bio * toE2;
             const F = theta * F_fast + (1 - theta) * F_slow;
+            if (selection === 'new') {
+                // Preserve the original new model for comparison, including its
+                // slower swallowed tail. This is not a fitted physiological rate.
+                return { Frac_fast: theta, k1_fast, k1_slow, k2, k3: defaultK3,
+                    k3_slow: 0.12, F, rateMGh: 0, F_fast, F_slow };
+            }
             return { Frac_fast: theta, k1_fast, k1_slow, k2, k3: defaultK3, F, rateMGh: 0, F_fast, F_slow,
                 metabolites: _getActiveE2Metabolites(),
                 oralInput: swallowedEstrogenInput(_activePKParams.e2_oral_bio, toE2) };
@@ -1637,6 +1649,7 @@ class PrecomputedEventModel {
     private model: (t: number) => number;
 
     constructor(event: DoseEvent, allEvents: DoseEvent[]) {
+        event = normalizeSublingualRecord(event);
         const params = resolveParams(event);
         const startTime = event.timeH;
         const dose = event.doseMG;
@@ -1683,7 +1696,15 @@ class PrecomputedEventModel {
                     };
                 }
                 break;
-            case Route.sublingual:
+            case Route.sublingual: {
+                if (params.metabolites && params.oralInput) {
+                    const profile = params.metabolites;
+                    const fast = profile.compileE2(params.k1_fast, [dose * params.Frac_fast * params.F_fast, 0, 0]);
+                    const input = params.oralInput.map(value => value * dose * (1 - params.Frac_fast)) as unknown as EstrogenAmounts;
+                    const swallowed = profile.compileE2(params.k1_slow, input);
+                    this.model = timeH => fast(timeH - startTime) + swallowed(timeH - startTime);
+                    break;
+                }
                 this.model = (timeH: number) => {
                     const tau = timeH - startTime;
                     if (tau < 0) return 0;
@@ -1696,18 +1717,10 @@ class PrecomputedEventModel {
                         : _analytic2C(tau, doseF, params.F_fast, params.k1_fast, params.k3);
 
                     // Swallowed (gut) fraction follows oral simplified path, so no extra k2 hydrolysis here.
-                    const slowAmount = _analytic2C(tau, doseS, params.F_slow, params.k1_slow, params.k3);
+                    const slowAmount = _analytic2C(tau, doseS, params.F_slow, params.k1_slow, params.k3_slow ?? params.k3);
 
                     return fastAmount + slowAmount;
                 };
-                break;
-            case Route.sublingualNew: {
-                const profile = params.metabolites!;
-                const fast = profile.compileE2(params.k1_fast, [dose * params.Frac_fast * params.F_fast, 0, 0]);
-                const input = params.oralInput!.map(value => value * dose * (1 - params.Frac_fast)) as unknown as EstrogenAmounts;
-                const swallowed = profile.compileE2(params.k1_slow, input);
-                // Only regenerated E2 is counted: E1/E1S are not E2 by weight.
-                this.model = timeH => fast(timeH - startTime) + swallowed(timeH - startTime);
                 break;
             }
             case Route.patchApply:
@@ -1771,6 +1784,7 @@ function computeMaxLifetimeH(params: PKParams, route: Route, allEvents: DoseEven
     if (params.k1_slow > 0) rates.push(params.k1_slow);
     if (params.k2 > 0) rates.push(params.k2);
     if (params.k3 > 0) rates.push(params.k3);
+    if (params.k3_slow && params.k3_slow > 0) rates.push(params.k3_slow);
     if (params.metabolites) rates.push(...params.metabolites.decayRates);
 
     if (rates.length === 0) return Infinity;
@@ -1780,7 +1794,7 @@ function computeMaxLifetimeH(params: PKParams, route: Route, allEvents: DoseEven
     // and the early fall. Extra numerical headroom covers convolution
     // prefactors; this cutoff is NOT a physiological disappearance time.
     const kMin = Math.min(...rates);
-    const tailExponent = params.metabolites ? Math.log(1e10) : (route === Route.sublingualNew ? Math.log(1e8) : 13.816);
+    const tailExponent = params.metabolites ? Math.log(1e10) : (normalizeRoute(route) === Route.sublingual ? Math.log(1e8) : 13.816);
     return Math.ceil(tailExponent / kMin);
 }
 
@@ -1788,7 +1802,7 @@ export function runSimulation(events: DoseEvent[], bodyWeightKG: number): Simula
     // Unmodelled drugs, and codes this build doesn't know, have no parameters
     // of their own: let through, they would fall into the estradiol branches
     // below and be counted as estradiol.
-    events = events.filter(e => !isUnmodelledDrug(e.ester));
+    events = events.map(normalizeSublingualRecord).filter(e => !isUnmodelledDrug(e.ester));
     if (events.length === 0 || bodyWeightKG <= 0) return null;
 
     const sortedEvents = [...events].sort((a, b) => a.timeH - b.timeH);
@@ -1840,7 +1854,7 @@ export function runSimulation(events: DoseEvent[], bodyWeightKG: number): Simula
     const sublingualNewOffsets = [0.125, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8, 12, 24, 48];
     const periEventTimes: number[] = [];
     for (const pc of precomputed) {
-        const offsets = pc.route === Route.sublingualNew ? sublingualNewOffsets : periEventOffsets;
+        const offsets = pc.route === Route.sublingual ? sublingualNewOffsets : periEventOffsets;
         for (const offset of offsets) {
             const t = pc.startTimeH + offset;
             if (t >= startTime && t <= endTime) {

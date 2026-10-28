@@ -163,7 +163,7 @@ This README explains the algorithms used for each drug/route, key parameters and
 
 ## 6) 舌下及口服 E2/EV：当前 TypeScript 实现（第二次修订）
 
-旧版 `Route.sublingual` 保留兼容；新版 `Route.sublingualNew` 与口服 E2/EV 共享
+舌下记录统一使用 `Route.sublingual`，设置中可选择 `legacy`（旧版）、`new`（原新版）或 `metabolite`（代谢回流版，默认）。历史 `sublingualNew` 自动兼容转换，不改变记录 ID、剂量、时间或吸收参数。代谢回流版与口服 E2/EV 共享
 **E2 ↔ E1 ↔ E1S** 的有效三池网络。完整资料、方程、先验、数值及限制见
 [2026-10-27 舌下模型审查](docs/sublingual-model-review.md)。这是机制启发近似，未完成临床拟合。
 

@@ -5,7 +5,7 @@ import { HRTModeProvider, useHRTMode } from './contexts/HRTModeContext';
 import { PixelCatProvider } from './contexts/PixelCatContext';
 import ErrorBoundary from './components/ErrorBoundary';
 import { AppTheme } from './constants';
-import { DoseEvent, decompressData, encryptData, decryptData } from '../logic';
+import { DoseEvent, decompressData, encryptData, decryptData, DEFAULT_PK_PARAMS } from '../logic';
 import { v4 as uuidv4 } from 'uuid';
 import { PlanItem, planEvent } from './utils/plan';
 import Plan from './pages/Plan';
@@ -528,6 +528,7 @@ const AppContent = () => {
                             onBack={() => handleViewChange('home')}
                             events={events}
                             weight={weight}
+                            pkParams={pkParams}
                             labResults={labResults}
                             calibration={calibration}
                             calibrationMethod={calibrationMethod}
@@ -620,6 +621,7 @@ const AppContent = () => {
                             weight={weight}
                             setIsWeightModalOpen={setIsWeightModalOpen}
                             pkParams={pkParams}
+                            onSublingualModelChange={value => setPkParams({ ...DEFAULT_PK_PARAMS, ...pkParams, sublingualModel: value })}
                             onNavigateToPKParams={() => handleViewChange('pk-params')}
                             onNavigateToHRTMode={() => handleViewChange('settings-hrt-mode')}
                             onNavigateToLanguage={() => handleViewChange('settings-language')}

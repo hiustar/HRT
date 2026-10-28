@@ -1,7 +1,7 @@
 import {
     DoseEvent, Route, Ester, ExtraKey, LabResult, SimulationResult,
     CalibrationMethod, CalibrationHistoryMode,
-    runSimulation, computeCalibration, isTestosteroneEster, isKnownEster, UNMODELLED_DRUGS,
+    runSimulation, computeCalibration, isTestosteroneEster, isKnownEster, UNMODELLED_DRUGS, normalizeSublingualRecord,
 } from '../../logic';
 
 /**
@@ -472,7 +472,7 @@ export const packUnitMG = (p: Pack): number => {
 export const packKindsFor = (route: Route): PackKind[] => {
     switch (route) {
         case Route.injection: return ['vial', 'bulk'];
-        case Route.oral: case Route.sublingual: case Route.sublingualNew: return ['pill', 'bulk'];
+        case Route.oral: case Route.sublingual: return ['pill', 'bulk'];
         case Route.gel: return ['pump', 'sachet', 'bulk'];
         case Route.patchApply: return ['patch'];
         default: return ['bulk'];
@@ -493,10 +493,11 @@ export const defaultPack = (kind: PackKind): Pack => {
 /** Supplies saved before packs existed carried a bare amount; read them as bulk. */
 export const normalizeSupply = (raw: any): Supply | null => {
     if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string') return null;
+    raw = normalizeSublingualRecord(raw);
     if (raw.pack && typeof raw.pack === 'object' && typeof raw.count === 'number') return raw as Supply;
     const amount = Number(raw.amount);
     if (!Number.isFinite(amount)) return null;
-    return { id: raw.id, route: raw.route, ester: raw.ester, pack: raw.route === Route.patchApply ? { kind: 'patch' } : { kind: 'bulk' }, count: amount, startedAt: Number(raw.startedAt) || Date.now() };
+    return { ...raw, id: raw.id, route: raw.route, ester: raw.ester, pack: raw.route === Route.patchApply ? { kind: 'patch' } : { kind: 'bulk' }, count: amount, startedAt: Number(raw.startedAt) || Date.now() };
 };
 
 export interface SupplyStatus {

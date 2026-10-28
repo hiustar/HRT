@@ -2,6 +2,11 @@ export type Lang = 'zh' | 'zh-TW' | 'yue' | 'en' | 'ja' | 'ko' | 'tr';
 
 export const TRANSLATIONS_BASE = {
     zh: {
+        "settings.sublingual_model": "舌下模型",
+        "settings.sublingual_model.legacy": "旧版",
+        "settings.sublingual_model.new": "原新版",
+        "settings.sublingual_model.metabolite": "代谢回流版",
+        "settings.sublingual_model_desc": "切换后将重新计算所有舌下记录，剂量和时间保持不变。",
         "settings.cat_style": "猫猫配色",
         "settings.cat_style.flag": "旗帜",
         "settings.cat_style.blue": "纯蓝",
@@ -87,7 +92,7 @@ export const TRANSLATIONS_BASE = {
         "regimen.route.injection": "肌肉注射",
         "regimen.route.oral": "口服",
         "regimen.route.sublingual": "舌下",
-        "regimen.route.sublingualNew": "新版舌下",
+        "regimen.route.sublingualNew": "舌下",
         "regimen.route.gel": "凝胶",
         "regimen.route.patchApply": "贴片",
         "regimen.every_hours": "每 {n} 小时",
@@ -418,7 +423,7 @@ export const TRANSLATIONS_BASE = {
         "route.injection": "肌肉注射 (Injection)",
         "route.oral": "口服 (Oral)",
         "route.sublingual": "舌下 (Sublingual)",
-        "route.sublingualNew": "新版舌下",
+        "route.sublingualNew": "舌下 (Sublingual)",
         "route.gel": "凝胶",
 
         "gel.site.arm": "手臂 (Arm)",
@@ -904,6 +909,11 @@ export const TRANSLATIONS_BASE = {
     },
 
     en: {
+        "settings.sublingual_model": "Sublingual model",
+        "settings.sublingual_model.legacy": "Old",
+        "settings.sublingual_model.new": "Original new",
+        "settings.sublingual_model.metabolite": "Metabolite return",
+        "settings.sublingual_model_desc": "Switching recalculates all sublingual records; doses and times are preserved.",
         "settings.cat_style": "Cat colours",
         "settings.cat_style.flag": "Flag",
         "settings.cat_style.blue": "Blue",
@@ -989,7 +999,7 @@ export const TRANSLATIONS_BASE = {
         "regimen.route.injection": "Injection",
         "regimen.route.oral": "Oral",
         "regimen.route.sublingual": "Sublingual",
-        "regimen.route.sublingualNew": "Sublingual (New)",
+        "regimen.route.sublingualNew": "Sublingual",
         "regimen.route.gel": "Gel",
         "regimen.route.patchApply": "Patch",
         "regimen.every_hours": "every {n} h",
@@ -1318,7 +1328,7 @@ export const TRANSLATIONS_BASE = {
         "route.injection": "Injection",
         "route.oral": "Oral",
         "route.sublingual": "Sublingual",
-        "route.sublingualNew": "Sublingual (New)",
+        "route.sublingualNew": "Sublingual",
         "route.gel": "Gel",
 
         "gel.site.arm": "Arm",
@@ -1817,6 +1827,11 @@ export const TRANSLATIONS_BASE = {
  * So anything missing here now leaks into two languages rather than one.
  */
 const ZH_TW = {
+    "settings.sublingual_model": "舌下模型",
+    "settings.sublingual_model.legacy": "舊版",
+    "settings.sublingual_model.new": "原新版",
+    "settings.sublingual_model.metabolite": "代謝回流版",
+    "settings.sublingual_model_desc": "切換後將重新計算所有舌下紀錄，劑量和時間保持不變。",
     "settings.cat_style": "貓貓配色",
     "settings.cat_style.flag": "旗幟",
     "settings.cat_style.blue": "純藍",
@@ -2090,6 +2105,7 @@ const ZH_TW = {
     "route.injection": "肌肉注射（Injection）",
     "route.oral": "口服（Oral）",
     "route.sublingual": "舌下（Sublingual）",
+    "route.sublingualNew": "舌下（Sublingual）",
     "route.gel": "凝膠",
 
     "gel.site.arm": "手臂（Arm）",
@@ -2493,7 +2509,7 @@ const ZH_TW = {
     "regimen.route.injection": "肌肉注射",
     "regimen.route.oral": "口服",
     "regimen.route.sublingual": "舌下",
-        "regimen.route.sublingualNew": "新版舌下",
+    "regimen.route.sublingualNew": "舌下",
     "regimen.route.gel": "凝膠",
     "regimen.route.patchApply": "貼片",
     "regimen.every_hours": "每 {n} 小時",
@@ -2729,6 +2745,11 @@ export const TRANSLATIONS = {
 
     yue: {
         ...ZH_TW,
+        "settings.sublingual_model": "舌下模型",
+        "settings.sublingual_model.legacy": "舊版",
+        "settings.sublingual_model.new": "原新版",
+        "settings.sublingual_model.metabolite": "代謝回流版",
+        "settings.sublingual_model_desc": "切換後會重新計算所有舌下記錄，劑量同時間維持不變。",
         "settings.cat_style": "貓貓配色",
         "settings.cat_style.flag": "旗幟",
         "settings.cat_style.blue": "純藍",
@@ -2989,7 +3010,7 @@ export const TRANSLATIONS = {
         "route.injection": "肌注 (Injection)",
         "route.oral": "口服 (Oral)",
         "route.sublingual": "舌下 (Sublingual)",
-        "route.sublingualNew": "新版舌下",
+        "route.sublingualNew": "舌下 (Sublingual)",
         "route.gel": "凝膠",
 
         "gel.site.arm": "手臂 (Arm)",
@@ -3293,6 +3314,11 @@ export const TRANSLATIONS = {
         "app.title": "HRT Tracker",
     },
     ja: {
+        "settings.sublingual_model": "舌下モデル",
+        "settings.sublingual_model.legacy": "旧版",
+        "settings.sublingual_model.new": "元の新版",
+        "settings.sublingual_model.metabolite": "代謝物再循環版",
+        "settings.sublingual_model_desc": "切り替えるとすべての舌下記録が再計算されます。用量と時刻は変わりません。",
         "settings.cat_style": "猫の配色",
         "settings.cat_style.flag": "フラッグ",
         "settings.cat_style.blue": "ブルー",
@@ -3579,7 +3605,7 @@ export const TRANSLATIONS = {
         "route.injection": "筋注 (Injection)",
         "route.oral": "経口 (Oral)",
         "route.sublingual": "舌下 (Sublingual)",
-        "route.sublingualNew": "新版舌下",
+        "route.sublingualNew": "舌下 (Sublingual)",
         "route.gel": "ジェル",
 
         "gel.site.arm": "腕 (Arm)",
@@ -3999,7 +4025,7 @@ export const TRANSLATIONS = {
         "regimen.route.injection": "筋注",
         "regimen.route.oral": "経口",
         "regimen.route.sublingual": "舌下",
-        "regimen.route.sublingualNew": "新版舌下",
+        "regimen.route.sublingualNew": "舌下",
         "regimen.route.gel": "ジェル",
         "regimen.route.patchApply": "パッチ",
         "regimen.every_hours": "{n}時間ごと",
@@ -4185,6 +4211,11 @@ export const TRANSLATIONS = {
     },
 
     ko: {
+        "settings.sublingual_model": "설하 모델",
+        "settings.sublingual_model.legacy": "기존 버전",
+        "settings.sublingual_model.new": "원래 새 버전",
+        "settings.sublingual_model.metabolite": "대사물 재순환 버전",
+        "settings.sublingual_model_desc": "변경하면 모든 설하 기록을 다시 계산하며, 용량과 시간은 유지됩니다.",
         "settings.cat_style": "고양이 색상",
         "settings.cat_style.flag": "깃발",
         "settings.cat_style.blue": "블루",
@@ -4461,6 +4492,7 @@ export const TRANSLATIONS = {
         "route.injection": "주사",
         "route.oral": "경구",
         "route.sublingual": "설하",
+        "route.sublingualNew": "설하",
         "route.gel": "젤",
 
         "gel.site.arm": "팔",
@@ -4836,6 +4868,7 @@ export const TRANSLATIONS = {
         "regimen.route.injection": "주사",
         "regimen.route.oral": "경구",
         "regimen.route.sublingual": "설하",
+        "regimen.route.sublingualNew": "설하",
         "regimen.route.gel": "젤",
         "regimen.route.patchApply": "패치",
         "regimen.every_hours": "{n}시간마다",
@@ -5064,6 +5097,11 @@ export const TRANSLATIONS = {
     },
     tr: {
         ...TRANSLATIONS_BASE.en,
+        "settings.sublingual_model": "Dil altı modeli",
+        "settings.sublingual_model.legacy": "Eski",
+        "settings.sublingual_model.new": "Özgün yeni",
+        "settings.sublingual_model.metabolite": "Metabolit geri dönüşü",
+        "settings.sublingual_model_desc": "Değiştirildiğinde tüm dil altı kayıtları yeniden hesaplanır; dozlar ve saatler korunur.",
         "settings.cat_style": "Kedi renkleri",
         "settings.cat_style.flag": "Bayrak",
         "settings.cat_style.blue": "Mavi",
@@ -5359,6 +5397,7 @@ export const TRANSLATIONS = {
         "route.injection": "Enjeksiyon",
         "route.oral": "Ağızdan",
         "route.sublingual": "Dil Altı",
+        "route.sublingualNew": "Dil Altı",
         "route.gel": "Jel",
 
         "gel.site.arm": "Kol",
@@ -5764,7 +5803,7 @@ export const TRANSLATIONS = {
         "regimen.route.injection": "Enjeksiyon",
         "regimen.route.oral": "Ağızdan",
         "regimen.route.sublingual": "Dil altı",
-        "regimen.route.sublingualNew": "Dil altı (Yeni)",
+        "regimen.route.sublingualNew": "Dil altı",
         "regimen.route.gel": "Jel",
         "regimen.route.patchApply": "Yama",
         "regimen.every_hours": "{n} saatte bir",

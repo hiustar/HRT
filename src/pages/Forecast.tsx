@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { CalibrationHistoryMode, CalibrationMethod, CalibrationResult, DoseEvent, Ester, ExtraKey, LabResult, Route, SL_TIER_ORDER, SublingualTierParams } from '../../logic';
+import { CalibrationHistoryMode, CalibrationMethod, CalibrationResult, DoseEvent, Ester, ExtraKey, LabResult, Route, SL_TIER_ORDER, SublingualTierParams, PKCustomParams, DEFAULT_PK_PARAMS } from '../../logic';
 import PageHeader, { PAGE_COLUMN, headerAction, headerActionAccent } from '../components/PageHeader';
 import CustomSelect from '../components/CustomSelect';
 import Switch from '../components/Switch';
@@ -27,7 +27,7 @@ const DRUGS: Record<'transfem' | 'transmasc', Partial<Record<Route, Ester[]>>> =
         [Route.injection]: [Ester.EV, Ester.EB, Ester.EC, Ester.EN, Ester.EU],
         [Route.oral]: [Ester.EV, Ester.E2],
         [Route.sublingual]: [Ester.E2, Ester.EV],
-        [Route.sublingualNew]: [Ester.E2, Ester.EV],
+
         [Route.gel]: [Ester.E2],
         [Route.patchApply]: [Ester.E2],
     },
@@ -61,6 +61,7 @@ interface ForecastProps {
     onBack: () => void;
     events: DoseEvent[];
     weight: number;
+    pkParams: PKCustomParams | null;
     labResults: LabResult[];
     calibration: CalibrationResult;
     calibrationMethod: CalibrationMethod;
@@ -72,7 +73,7 @@ interface ForecastProps {
 }
 
 const Forecast: React.FC<ForecastProps> = ({
-    onBack, events, weight, labResults, calibration, calibrationMethod, calibrationHistoryMode, regimens, nowH, isDarkMode, onSaveTemplate,
+    onBack, events, weight, pkParams, labResults, calibration, calibrationMethod, calibrationHistoryMode, regimens, nowH, isDarkMode, onSaveTemplate,
 }) => {
     const { t, lang } = useTranslation();
     const { mode, isTransmasc } = useHRTMode();
@@ -124,24 +125,25 @@ const Forecast: React.FC<ForecastProps> = ({
         const wear = num(d.wearDays);
         const extras: PlanSpec['extras'] =
             d.route === Route.patchApply ? { [ExtraKey.releaseRateUGPerDay]: dose, [ExtraKey.patchWearH]: wear > 0 ? wear * 24 : d.intervalH }
-            : (d.route === Route.sublingual || d.route === Route.sublingualNew) ? { [ExtraKey.sublingualTier]: d.slTier }
+            : (d.route === Route.sublingual) ? { [ExtraKey.sublingualTier]: d.slTier }
             : d.route === Route.gel ? { [ExtraKey.gelSite]: 0 } : {};
         return { route: d.route, ester: d.ester, doseMG: d.route === Route.patchApply ? 0 : dose, extras, intervalH: d.intervalH, startH: d.startH, replace: d.replace };
     };
 
     const horizonH = horizonWeeks * 7 * 24;
+    const paramsKey = JSON.stringify({ ...DEFAULT_PK_PARAMS, ...pkParams });
     const input: ForecastInput = useMemo(() => ({
         events, weight, labResults, calibrationMethod, calibrationHistoryMode, isTransmasc,
         nowH: hourNow, horizonH, target,
         fitErrPct: labResults.length ? calibration.fitErrPct : null,
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }), [events, weight, labResults, calibrationMethod, calibrationHistoryMode, isTransmasc, hourNow, horizonH, calibration.fitErrPct]);
+    }), [events, weight, labResults, calibrationMethod, calibrationHistoryMode, isTransmasc, hourNow, horizonH, calibration.fitErrPct, paramsKey]);
 
     // Each scenario is a few hundred ms of simulation. Run after paint, debounce
     // typing, and remember every spec already run so switching plans or
     // horizons back is free.
     const cache = useRef(new Map<string, Scenario | null>());
-    const inputKey = `${events.length}|${weight}|${labResults.length}|${calibrationMethod}|${calibrationHistoryMode}|${isTransmasc}|${hourNow}|${horizonH}`;
+    const inputKey = `${events.length}|${weight}|${labResults.length}|${calibrationMethod}|${calibrationHistoryMode}|${isTransmasc}|${hourNow}|${horizonH}|${paramsKey}`;
     const [current, setCurrent] = useState<Scenario | null>(null);
     const [results, setResults] = useState<Record<string, Scenario | null>>({});
     const [busy, setBusy] = useState(true);
@@ -290,7 +292,7 @@ const Forecast: React.FC<ForecastProps> = ({
                             onChange={v => update({ intervalH: Number(v) })}
                             options={intervalOptions.map(h => ({ value: String(h), label: intervalLabel(h, t) }))}
                         />
-                        {(active.route === Route.sublingual || active.route === Route.sublingualNew) && (
+                        {(active.route === Route.sublingual) && (
                             <CustomSelect label={t('field.sl_absorption')} value={String(active.slTier)} onChange={v => update({ slTier: Number(v) })} options={tierOptions} />
                         )}
                         {active.route === Route.patchApply && (

@@ -41,7 +41,7 @@ const AmountFields: React.FC<{ draft: PlanDraft; onChange: (patch: Partial<PlanD
                 />
             </div>
         )}
-        {(draft.route === Route.sublingual || draft.route === Route.sublingualNew) && (
+        {(draft.route === Route.sublingual) && (
             <div className="col-span-2">
                 <CustomSelect
                     label={t('field.sl_absorption')}

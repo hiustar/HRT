@@ -223,7 +223,10 @@ function sanitizeShareSnapshot(raw: unknown): { snapshot?: DosageShareSnapshot; 
     if (typeof event.id !== 'string' || event.id.length < 1 || event.id.length > 128) return { error: `${path}.id is invalid` };
     if (eventIds.has(event.id)) return { error: `${path}.id must be unique` };
     eventIds.add(event.id);
-    if (typeof event.route !== 'string' || !SHARE_ROUTES.has(event.route)) return { error: `${path}.route is invalid` };
+    // Older clients used the model name as the route. Store the canonical
+    // route while continuing to accept their share payloads.
+    const route = event.route === 'sublingualNew' ? 'sublingual' : event.route;
+    if (typeof route !== 'string' || !SHARE_ROUTES.has(route)) return { error: `${path}.route is invalid` };
     if (typeof event.ester !== 'string' || !SHARE_ESTERS.has(event.ester) || !modeEsters.has(event.ester)) return { error: `${path}.ester is invalid for this mode` };
     if (typeof event.timeH !== 'number' || !Number.isFinite(event.timeH) || Math.abs(event.timeH) > 100_000_000) return { error: `${path}.timeH is invalid` };
     if (typeof event.doseMG !== 'number' || !Number.isFinite(event.doseMG) || event.doseMG < 0 || event.doseMG > 1_000_000) return { error: `${path}.doseMG is invalid` };
@@ -237,7 +240,7 @@ function sanitizeShareSnapshot(raw: unknown): { snapshot?: DosageShareSnapshot; 
     }
     events.push({
       id: event.id,
-      route: event.route,
+      route,
       timeH: event.timeH,
       doseMG: event.doseMG,
       ester: event.ester,

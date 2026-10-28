@@ -1,4 +1,4 @@
-import { DoseEvent, HRTMode, SimulationResult } from '../../logic';
+import { DoseEvent, HRTMode, SimulationResult, normalizeSublingualRecord } from '../../logic';
 import { apiEndpoint, apiFetch } from './apiClient';
 
 export interface SharedDosageSnapshot {
@@ -80,6 +80,15 @@ const readError = async (response: Response): Promise<ShareApiError> => {
     );
 };
 
+const normalizeSnapshot = (snapshot: SharedDosageSnapshot): SharedDosageSnapshot => ({
+    ...snapshot,
+    events: snapshot.events.map(normalizeSublingualRecord),
+});
+
+const normalizeShareDetails = (details: ShareDetails): ShareDetails => ({
+    ...details, snapshot: normalizeSnapshot(details.snapshot),
+});
+
 export const sharingService = {
     async create(
         authToken: string,
@@ -93,7 +102,7 @@ export const sharingService = {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                snapshot,
+                snapshot: normalizeSnapshot(snapshot),
                 password: options.password || undefined,
                 expiresAt: options.expiresAt,
                 live: options.live ?? false,
@@ -118,7 +127,7 @@ export const sharingService = {
             if (body.code === 'PASSWORD_REQUIRED' || body.passwordRequired) return body;
         }
         if (!response.ok) throw await readError(response);
-        return await response.json() as ShareDetails;
+        return normalizeShareDetails(await response.json() as ShareDetails);
     },
 
     async unlock(token: string, password: string): Promise<ShareDetails> {
@@ -132,7 +141,7 @@ export const sharingService = {
             body: JSON.stringify({ token, password }),
         });
         if (!response.ok) throw await readError(response);
-        return await response.json() as ShareDetails;
+        return normalizeShareDetails(await response.json() as ShareDetails);
     },
 
     async list(authToken: string): Promise<ShareSummary[]> {
@@ -159,7 +168,7 @@ export const sharingService = {
                 'Authorization': `Bearer ${authToken}`,
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ snapshot }),
+            body: JSON.stringify({ snapshot: normalizeSnapshot(snapshot) }),
             signal,
         });
         if (!response.ok) throw await readError(response);

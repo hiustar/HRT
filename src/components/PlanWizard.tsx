@@ -19,7 +19,7 @@ const COMMON_FREQ: Partial<Record<Route, string[]>> = {
     [Route.injection]: ['e3', 'e5', 'e7', 'e10', 'e14'],
     [Route.oral]: ['d1', 'd2', 'd3', 'e2'],
     [Route.sublingual]: ['d1', 'd2', 'd3', 'e2'],
-    [Route.sublingualNew]: ['d1', 'd2', 'd3', 'e2'],
+
     [Route.gel]: ['d1', 'd2'],
     [Route.patchApply]: ['e3', 'e3.5', 'e7'],
 };
@@ -89,7 +89,7 @@ const PlanWizard: React.FC<PlanWizardProps> = ({ plan, onAdd, onCancel }) => {
         ...(!draft || drugs.length > 1 ? ['drug' as const] : []),
         'dose',
         ...(draft?.route === Route.gel ? ['site' as const] : []),
-        ...((draft?.route === Route.sublingual || draft?.route === Route.sublingualNew) ? ['hold' as const] : []),
+        ...((draft?.route === Route.sublingual) ? ['hold' as const] : []),
         'freq',
     ];
     const step = steps[Math.min(at, steps.length - 1)];

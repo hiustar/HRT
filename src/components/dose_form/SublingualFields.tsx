@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from '../../contexts/LanguageContext';
-import { Route, Ester, SL_TIER_ORDER, SublingualTierParams } from '../../../logic';
+import { Route, Ester, SL_TIER_ORDER, SublingualTierParams, getActiveSublingualModel } from '../../../logic';
 import CustomSelect from '../CustomSelect';
 
 interface SublingualFieldsProps {
@@ -56,7 +56,7 @@ const SublingualFields: React.FC<SublingualFieldsProps> = ({
 
     return (
         <div className="space-y-4">
-            {route === Route.sublingualNew && (
+            {getActiveSublingualModel() === 'metabolite' && (
                 <div className="space-y-1 text-xs text-[var(--text-muted)]" role="note">
                     <p>{t('sl.new_model_note')}</p>
                     <p>{t('sl.metabolite_note')}</p>
@@ -112,7 +112,7 @@ const SublingualFields: React.FC<SublingualFieldsProps> = ({
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {(ester !== Ester.E2) && (
-                    <div className={`space-y-2 ${(ester === Ester.EV && (route === Route.sublingual || route === Route.sublingualNew)) ? 'col-span-2' : ''}`}>
+                    <div className={`space-y-2 ${(ester === Ester.EV && (route === Route.sublingual)) ? 'col-span-2' : ''}`}>
                         <label className="block text-xs font-semibold text-[var(--text-muted)] pl-1">{t('field.dose_raw')}</label>
                         <input
                             type="number" inputMode="decimal"
@@ -126,7 +126,7 @@ const SublingualFields: React.FC<SublingualFieldsProps> = ({
                     </div>
                 )}
 
-                {!(ester === Ester.EV && (route === Route.sublingual || route === Route.sublingualNew)) && ester !== Ester.CPA && (
+                {!(ester === Ester.EV && (route === Route.sublingual)) && ester !== Ester.CPA && (
                     <div className={`space-y-2 ${(ester === Ester.E2) ? "col-span-2" : ""}`}>
                         <label className="block text-xs font-semibold text-[var(--text-muted)] pl-1">
                             {t('field.dose_e2')}
@@ -143,7 +143,7 @@ const SublingualFields: React.FC<SublingualFieldsProps> = ({
                     </div>
                 )}
 
-                {(ester === Ester.EV && (route === Route.sublingual || route === Route.sublingualNew)) && (
+                {(ester === Ester.EV && (route === Route.sublingual)) && (
                     <div className="col-span-2">
                         <p className="text-xs text-[var(--text-muted)] mt-1 pl-1">
                             {t('field.dose_e2')}: {e2Dose ? `${e2Dose} mg` : '--'}

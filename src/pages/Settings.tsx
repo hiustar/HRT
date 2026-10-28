@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { ChevronRight, Settings2, Database, Info } from 'lucide-react';
 import { Lang } from '../i18n/translations';
 import { AppTheme } from '../constants';
-import { DoseEvent, PKCustomParams } from '../../logic';
+import { DoseEvent, PKCustomParams, PKNumericParam, SublingualModel, SUBLINGUAL_MODELS, DEFAULT_PK_PARAMS, normalizeSublingualModel } from '../../logic';
 import { useHRTMode } from '../contexts/HRTModeContext';
 import { usePixelCats, CatStyle } from '../contexts/PixelCatContext';
 import Switch from '../components/Switch';
@@ -32,6 +32,7 @@ interface SettingsProps {
     setIsWeightModalOpen: (isOpen: boolean) => void;
     pkParams: PKCustomParams | null;
     onNavigateToPKParams: () => void;
+    onSublingualModelChange: (model: SublingualModel) => void;
     onNavigateToHRTMode: () => void;
     onNavigateToLanguage: () => void;
     onNavigateToAppearance: () => void;
@@ -107,7 +108,7 @@ let _savedMobileView: MobileView = 'list';
 const Settings: React.FC<SettingsProps> = ({
     t, lang, theme, languageOptions, onClearAllEvents, events,
     showDialog, setIsDisclaimerOpen, onShowIntro, onNavigateToTransparency,
-    weight, pkParams, onNavigateToPKParams, onNavigateToHRTMode,
+    weight, pkParams, onNavigateToPKParams, onSublingualModelChange, onNavigateToHRTMode,
     onNavigateToLanguage, onNavigateToAppearance, onNavigateToWeight,
     onNavigateToExport, onNavigateToImport, autoSync, setAutoSync, isLoggedIn,
     devMode, setDevMode, hideSiteLabel, setHideSiteLabel, showPrediction, setShowPrediction, onNavigateToMilkTea, onNavigateToCatStates, isAdmin, onNavigateToAdmin,
@@ -167,9 +168,27 @@ const Settings: React.FC<SettingsProps> = ({
                     value={`${weight} kg`}
                     onClick={() => navTo(onNavigateToWeight, 'general')}
                 />
+                {mode === 'transfem' && (
+                    <div className="py-3.5">
+                        <label className="flex items-center justify-between gap-4">
+                            <span className={rowLabel}>{t('settings.sublingual_model')}</span>
+                            <select
+                                className="min-h-[44px] max-w-[55%] rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--field)] px-3 text-[0.9375rem] text-[var(--text)] focus:border-[var(--accent-ink)]"
+                                value={normalizeSublingualModel(pkParams?.sublingualModel)}
+                                onChange={e => onSublingualModelChange(normalizeSublingualModel(e.target.value))}
+                            >
+                                {SUBLINGUAL_MODELS.map(model => (
+                                    <option key={model} value={model}>{t(`settings.sublingual_model.${model}`)}</option>
+                                ))}
+                            </select>
+                        </label>
+                        <p className={`text-xs ${muted} mt-1`}>{t('settings.sublingual_model_desc')}</p>
+                    </div>
+                )}
                 <NavRow
                     label={t('settings.pk_params')}
-                    value={pkParams && (
+                    value={pkParams && (Object.keys(DEFAULT_PK_PARAMS) as (keyof PKCustomParams)[])
+                        .some(key => key !== 'sublingualModel' && pkParams[key as PKNumericParam] !== undefined && pkParams[key as PKNumericParam] !== DEFAULT_PK_PARAMS[key as PKNumericParam]) && (
                         <span className="text-xs text-[var(--warning)] font-medium mr-1">
                             {t('pk.customized')}
                         </span>

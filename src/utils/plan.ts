@@ -1,4 +1,4 @@
-import { DoseEvent, Ester, ExtraKey, GNRH_AGONISTS, Route } from '../../logic';
+import { DoseEvent, Ester, ExtraKey, GNRH_AGONISTS, Route, normalizeRoute } from '../../logic';
 import { Regimen, hormoneOf, lapseH } from './regimen';
 
 /**
@@ -53,7 +53,6 @@ export const PLAN_DRUGS: Record<'transfem' | 'transmasc', Partial<Record<Route, 
         [Route.injection]: [Ester.EV, Ester.EB, Ester.EC, Ester.EN, Ester.EU, Ester.LEUP, Ester.TRIP],
         [Route.oral]: [Ester.EV, Ester.E2, Ester.CPA, Ester.SPIRO, Ester.BICA, Ester.MPA, Ester.RLX],
         [Route.sublingual]: [Ester.E2, Ester.EV],
-        [Route.sublingualNew]: [Ester.E2, Ester.EV],
         [Route.gel]: [Ester.E2],
         [Route.patchApply]: [Ester.E2],
     },
@@ -105,7 +104,7 @@ export const draftToItem = (d: PlanDraft, id: string): PlanItem | null => {
     const isPatch = d.route === Route.patchApply;
     const extras: PlanItem['extras'] =
         isPatch ? { [ExtraKey.releaseRateUGPerDay]: dose, [ExtraKey.patchWearH]: f.everyDays * 24 }
-        : (d.route === Route.sublingual || d.route === Route.sublingualNew) ? { [ExtraKey.sublingualTier]: d.slTier }
+        : (d.route === Route.sublingual) ? { [ExtraKey.sublingualTier]: d.slTier }
         : d.route === Route.gel ? { [ExtraKey.gelSite]: d.gelSite } : {};
     return { id, route: d.route, ester: d.ester, doseMG: isPatch ? 0 : dose, extras, everyDays: f.everyDays, timesPerDay: f.timesPerDay };
 };
@@ -121,13 +120,14 @@ export const itemToDraft = (i: PlanItem): PlanDraft => ({
 
 export const normalizePlanItem = (raw: any): PlanItem | null => {
     if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string') return null;
-    if (!Object.values(Route).includes(raw.route) || !Object.values(Ester).includes(raw.ester)) return null;
+    const route = normalizeRoute(raw.route);
+    if (!route || !Object.values(Ester).includes(raw.ester)) return null;
     const everyDays = Number(raw.everyDays);
     const timesPerDay = Math.round(Number(raw.timesPerDay));
     const doseMG = Number(raw.doseMG);
     if (!(everyDays >= 1) || !(timesPerDay >= 1) || !Number.isFinite(doseMG) || doseMG < 0) return null;
     return {
-        id: raw.id, route: raw.route, ester: raw.ester, doseMG,
+        ...raw, id: raw.id, route, ester: raw.ester, doseMG,
         extras: raw.extras && typeof raw.extras === 'object' ? raw.extras : {},
         everyDays, timesPerDay: everyDays > 1 ? 1 : timesPerDay,
     };

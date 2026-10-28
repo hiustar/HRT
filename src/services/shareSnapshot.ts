@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import { DoseEvent, HRTMode, SimulationResult } from '../../logic';
+import { DoseEvent, HRTMode, SimulationResult, normalizeSublingualRecord } from '../../logic';
 import { SharedDosageSnapshot } from './sharing';
 
 const MAX_SHARED_SIMULATION_POINTS = 2500;
@@ -93,7 +93,7 @@ export const buildSharedDosageSnapshot = ({
         createdAt: Date.now(),
         // Never send the app's stable local event IDs to the share service.
         events: events.map(event => ({
-            ...event,
+            ...normalizeSublingualRecord(event),
             id: uuidv4(),
             extras: { ...event.extras },
         })),

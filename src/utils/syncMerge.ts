@@ -28,7 +28,7 @@
  * last-write timestamp and are resolved last-write-wins.
  */
 
-import { isTestosteroneEster, isT_LabUnit } from '../../logic';
+import { isTestosteroneEster, isT_LabUnit, normalizeSublingualRecord } from '../../logic';
 
 export type ModeKey = 'transfem' | 'transmasc';
 export const MODE_KEYS: readonly ModeKey[] = ['transfem', 'transmasc'];
@@ -50,6 +50,8 @@ export interface ModeBlock {
 }
 
 export interface SyncState {
+    /** Read-time metadata only: rewrite the next snapshot using canonical routes. */
+    needsRouteNormalization?: boolean;
     modes: Record<ModeKey, ModeBlock>;
     /** `undefined` = the payload said nothing about weight. */
     weight?: number;
@@ -168,6 +170,22 @@ function mergeTombstoneMaps(a: TombstoneMap, b: TombstoneMap): TombstoneMap {
 
 // --- Payload normalisation --------------------------------------------------
 
+/** Read a v2 mode block, falling back per missing field to that mode's flat mirrors.
+ * Explicitly present fields (including empty arrays) are authoritative.
+ */
+export function readModePayloadBlock(payload: any, mode: ModeKey): Record<string, any> {
+    const raw = payload?.modes?.[mode];
+    const block: Record<string, any> = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {};
+    if (payload?.mode === mode) {
+        for (const field of ['events', 'labResults', 'doseTemplates', 'plan', 'supplies', 'deletions']) {
+            if (!Object.prototype.hasOwnProperty.call(block, field) && Object.prototype.hasOwnProperty.call(payload, field)) {
+                block[field] = payload[field];
+            }
+        }
+    }
+    return block;
+}
+
 /**
  * Route a flat (pre-`modes`) payload into the two mode blocks.
  *
@@ -180,7 +198,7 @@ function mergeTombstoneMaps(a: TombstoneMap, b: TombstoneMap): TombstoneMap {
 function routeFlatPayload(payload: any, modes: Record<ModeKey, ModeBlock>): void {
     for (const ev of asArray(payload.events)) {
         if (!ev || typeof ev !== 'object') continue;
-        modes[isTestosteroneEster(ev.ester) ? 'transmasc' : 'transfem'].events.push(ev);
+        modes[isTestosteroneEster(ev.ester) ? 'transmasc' : 'transfem'].events.push(normalizeSublingualRecord(ev));
     }
     for (const lab of asArray(payload.labResults)) {
         if (!lab || typeof lab !== 'object') continue;
@@ -188,13 +206,13 @@ function routeFlatPayload(payload: any, modes: Record<ModeKey, ModeBlock>): void
     }
     for (const tpl of asArray(payload.doseTemplates)) {
         if (!tpl || typeof tpl !== 'object') continue;
-        modes[isTestosteroneEster(tpl.ester) ? 'transmasc' : 'transfem'].doseTemplates.push(tpl);
+        modes[isTestosteroneEster(tpl.ester) ? 'transmasc' : 'transfem'].doseTemplates.push(normalizeSublingualRecord(tpl));
     }
     for (const pl of asArray(payload.plan)) {
-        if (pl && typeof pl === 'object') modes['transfem'].plan.push(pl);
+        if (pl && typeof pl === 'object') modes['transfem'].plan.push(normalizeSublingualRecord(pl));
     }
     for (const sp of asArray(payload.supplies)) {
-        if (sp && typeof sp === 'object') modes['transfem'].supplies.push(sp);
+        if (sp && typeof sp === 'object') modes['transfem'].supplies.push(normalizeSublingualRecord(sp));
     }
 }
 
@@ -202,6 +220,16 @@ function routeFlatPayload(payload: any, modes: Record<ModeKey, ModeBlock>): void
 export function normalizeSyncState(payload: unknown): SyncState {
     const state = emptySyncState();
     if (!payload) return state;
+
+    // Normalized fingerprints must regard both names as the same medication,
+    // but the latest cloud snapshot should still get one canonical rewrite.
+    const routeLists = Array.isArray(payload) ? [payload] : typeof payload === 'object'
+        ? [payload, ...MODE_KEYS.map(m => (payload as any).modes?.[m])]
+            .flatMap(block => block ? [block.events, block.doseTemplates, block.plan, block.supplies] : [])
+        : [];
+    if (routeLists.some(list => Array.isArray(list) && list.some(item => item?.route === 'sublingualNew'))) {
+        state.needsRouteNormalization = true;
+    }
 
     // Oldest export format: a naked array of dose events.
     if (Array.isArray(payload)) {
@@ -214,14 +242,13 @@ export function normalizeSyncState(payload: unknown): SyncState {
 
     if (p.modes && typeof p.modes === 'object' && !Array.isArray(p.modes)) {
         for (const m of MODE_KEYS) {
-            const block = p.modes[m];
-            if (!block || typeof block !== 'object') continue;
+            const block = readModePayloadBlock(p, m);
             state.modes[m] = {
-                events: asArray(block.events),
+                events: asArray(block.events).map(normalizeSublingualRecord),
                 labResults: asArray(block.labResults),
-                doseTemplates: asArray(block.doseTemplates),
-                plan: asArray(block.plan),
-                supplies: asArray(block.supplies),
+                doseTemplates: asArray(block.doseTemplates).map(normalizeSublingualRecord),
+                plan: asArray(block.plan).map(normalizeSublingualRecord),
+                supplies: asArray(block.supplies).map(normalizeSublingualRecord),
                 deletions: sanitizeTombstones(block.deletions),
             };
         }
@@ -250,12 +277,6 @@ export function normalizeSyncState(payload: unknown): SyncState {
  * `updatedAt` is excluded on purpose: it is bookkeeping, and including it would
  * make two byte-identical records look like a conflict.
  */
-const CONTENT_FIELDS: Record<RecordKind, readonly string[]> = {
-    events: ['route', 'ester', 'doseMG', 'timeH', 'extras'],
-    labResults: ['unit', 'concValue', 'timeH'],
-    doseTemplates: ['name', 'route', 'ester', 'doseMG', 'extras'],
-};
-
 export function stableString(value: unknown): string {
     if (value === null || value === undefined) return '';
     if (Array.isArray(value)) return `[${value.map(stableString).join(',')}]`;
@@ -269,8 +290,13 @@ export function stableString(value: unknown): string {
     return Number.isFinite(n) && String(value).trim() !== '' ? String(n) : String(value);
 }
 
-function contentFingerprint(kind: RecordKind, record: any): string {
-    return CONTENT_FIELDS[kind].map(f => stableString(record?.[f])).join('|');
+function contentFingerprint(record: any): string {
+    const normalized = normalizeSublingualRecord(record);
+    if (!normalized || typeof normalized !== 'object') return '';
+    // Preserve extension fields from a newer app as well as fields this build
+    // understands. A route-only rewrite must not upload an older, stripped copy.
+    const { id, updatedAt, ...content } = normalized;
+    return stableString(content);
 }
 
 function recordId(record: any): string | null {
@@ -279,6 +305,22 @@ function recordId(record: any): string | null {
 
 function recordStamp(record: any): number {
     return asTimestamp(record?.updatedAt);
+}
+
+/** Resolve alias duplicates by edit time, then content; never by array order. */
+export function deduplicateRecords<T extends { id: string }>(records: T[]): T[] {
+    const byId = new Map<string, T>();
+    for (const raw of records) {
+        if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id) continue;
+        const record = normalizeSublingualRecord(raw);
+        const previous = byId.get(record.id);
+        if (!previous || recordStamp(record) > recordStamp(previous)
+            || (recordStamp(record) === recordStamp(previous)
+                && contentFingerprint(record) > contentFingerprint(previous))) {
+            byId.set(record.id, record);
+        }
+    }
+    return [...byId.values()];
 }
 
 // --- Merge ------------------------------------------------------------------
@@ -293,7 +335,7 @@ function mergeKind(
     const out = new Map<string, any>();
     const dropped = new Set<string>();
 
-    for (const record of local) {
+    for (const record of deduplicateRecords(local)) {
         const id = recordId(record);
         if (!id) continue;
         if (tombstones[id] !== undefined) {
@@ -308,7 +350,7 @@ function mergeKind(
         out.set(id, record);
     }
 
-    for (const record of remote) {
+    for (const record of deduplicateRecords(remote)) {
         const id = recordId(record);
         if (!id) continue;
         if (tombstones[id] !== undefined) continue;
@@ -320,8 +362,8 @@ function mergeKind(
             continue;
         }
 
-        const mineFp = contentFingerprint(kind, mine);
-        const theirsFp = contentFingerprint(kind, record);
+        const mineFp = contentFingerprint(mine);
+        const theirsFp = contentFingerprint(record);
         if (mineFp === theirsFp) {
             // Same record on both sides. Adopt the later stamp so the two copies
             // stop differing in metadata and the comparison settles.
@@ -428,8 +470,8 @@ export function mergeSyncStates(local: SyncState, remote: SyncState | null): Mer
     return {
         merged,
         stats,
-        localChanged: mergedFp !== fingerprintState(local),
-        remoteStale: mergedFp !== fingerprintState(remote),
+        localChanged: !!local.needsRouteNormalization || mergedFp !== fingerprintState(local),
+        remoteStale: !!remote.needsRouteNormalization || mergedFp !== fingerprintState(remote),
     };
 }
 
@@ -471,15 +513,15 @@ export function fingerprintState(state: SyncState): string {
             const rows = (block[kind] as any[])
                 .map(r => {
                     const id = recordId(r);
-                    return id ? `${id}=${contentFingerprint(kind, r)}` : null;
+                    return id ? `${id}=${contentFingerprint(r)}` : null;
                 })
                 .filter((r): r is string => r !== null)
                 .sort();
             parts.push(`${m}.${kind}:${rows.join(';')}`);
             parts.push(`${m}.${kind}.del:${Object.keys(block.deletions[kind]).sort().join(';')}`);
         }
-        parts.push(`${m}.plan:${JSON.stringify(block.plan || [])}`);
-        parts.push(`${m}.supplies:${JSON.stringify(block.supplies || [])}`);
+        parts.push(`${m}.plan:${JSON.stringify((block.plan || []).map(normalizeSublingualRecord))}`);
+        parts.push(`${m}.supplies:${JSON.stringify((block.supplies || []).map(normalizeSublingualRecord))}`);
     }
     parts.push(`weight:${state.weight === undefined ? '' : stableString(state.weight)}`);
     parts.push(`pkParams:${state.pkParams === undefined ? '' : stableString(state.pkParams)}`);

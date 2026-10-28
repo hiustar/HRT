@@ -1,9 +1,9 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import PageHeader, { PAGE_COLUMN } from '../components/PageHeader';
 import { RotateCcw, ChevronDown, AlertTriangle, Info } from 'lucide-react';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useDialog } from '../contexts/DialogContext';
-import { PKCustomParams, DEFAULT_PK_PARAMS } from '../../logic';
+import { PKCustomParams, PKNumericParam, DEFAULT_PK_PARAMS, normalizeSublingualModel } from '../../logic';
 
 interface PKParamsPageProps {
     pkParams: PKCustomParams | null;
@@ -15,7 +15,7 @@ interface PKParamsPageProps {
 type SectionKey = 'e2_inj' | 'e2_oral_sl' | 'e2_gel' | 'e2_core' | 't_inj' | 't_other';
 
 interface FieldDef {
-    key: keyof PKCustomParams;
+    key: PKNumericParam;
     labelKey: string;
     min: number;
     max: number;
@@ -92,6 +92,9 @@ const divider = "border-b border-[var(--border)]";
 const PKParamsPage: React.FC<PKParamsPageProps> = ({ pkParams, onSave, onReset, onBack }) => {
     const { t } = useTranslation();
     const { showDialog } = useDialog();
+    // Confirmation can remain open across a sync, so use the latest props when it resolves.
+    const latestProps = useRef({ pkParams, onReset });
+    latestProps.current = { pkParams, onReset };
 
     const [draft, setDraft] = useState<PKCustomParams>(() =>
         pkParams ? { ...DEFAULT_PK_PARAMS, ...pkParams } : { ...DEFAULT_PK_PARAMS }
@@ -108,26 +111,26 @@ const PKParamsPage: React.FC<PKParamsPageProps> = ({ pkParams, onSave, onReset, 
         });
     };
 
-    const updateField = useCallback((key: keyof PKCustomParams, rawValue: string, min: number, max: number) => {
+    const updateField = useCallback((key: PKNumericParam, rawValue: string, min: number, max: number) => {
         const num = parseFloat(rawValue);
         if (!Number.isFinite(num)) return;
         setDraft(prev => ({ ...prev, [key]: Math.max(min, Math.min(max, num)) }));
     }, []);
 
     const handleSave = () => {
-        onSave(draft);
+        onSave({ ...draft, sublingualModel: normalizeSublingualModel(pkParams?.sublingualModel) });
         setSaved(true);
         setTimeout(() => setSaved(false), 2000);
     };
 
     const handleReset = () => {
         showDialog('confirm', t('pk.reset_confirm'), () => {
-            setDraft({ ...DEFAULT_PK_PARAMS });
-            onReset();
+            setDraft({ ...DEFAULT_PK_PARAMS, sublingualModel: normalizeSublingualModel(latestProps.current.pkParams?.sublingualModel) });
+            latestProps.current.onReset();
         }, { danger: true });
     };
 
-    const isCustomized = (key: keyof PKCustomParams) => draft[key] !== DEFAULT_PK_PARAMS[key];
+    const isCustomized = (key: PKNumericParam) => draft[key] !== DEFAULT_PK_PARAMS[key];
 
     return (
         <div className="relative pb-32">

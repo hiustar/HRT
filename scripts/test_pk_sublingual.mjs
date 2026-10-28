@@ -22,7 +22,7 @@ const realNow = Date.now;
 Date.now = () => start * 3_600_000;
 after(() => { Date.now = realNow; applyPKOverrides(null); });
 const at = [0, 1 / 60, 0.25, 0.5, 0.75, 1, 1.5, 2, 4, 6, 8, 12, 24, 48, 96];
-function event(ester = Ester.E2, theta = 0.11, doseMG = 1, route = Route.sublingualNew, timeH = start) {
+function event(ester = Ester.E2, theta = 0.11, doseMG = 1, route = Route.sublingual, timeH = start) {
     return { id: `${route}-${ester}-${timeH}`, route, ester, doseMG, timeH,
         extras: { [ExtraKey.sublingualTheta]: theta } };
 }
@@ -173,7 +173,7 @@ for (const ester of [Ester.E2, Ester.EV]) {
     });
     test(`${ester}: zero dose, dose/weight scaling, timing and repeated-dose superposition`, () => {
         applyPKOverrides(null);
-        const events = [event(ester), event(ester, 0.11, 2, Route.sublingualNew, start + 8)];
+        const events = [event(ester), event(ester, 0.11, 2, Route.sublingual, start + 8)];
         const sim = runSimulation(events, 70), sim140 = runSimulation(events, 140);
         for (const offset of [0.25, 1, 2, 4, 8, 9, 10, 12, 16, 20, 24, 32]) {
             const index = sim.timeH.indexOf(start + offset);
@@ -249,7 +249,7 @@ test('daily dosing builds residual pool and converges; not confused with single-
     const single = model(event()), fn = t => single.amount(start + t);
     const trough = n => Array.from({ length: n }, (_, i) => fn(24 * (i + 1))).reduce((sum, v) => sum + v, 0);
     assert.ok(trough(30) > trough(1)); close(trough(30), trough(60), 'steady trough convergence', 1e-8);
-    const events = Array.from({ length: 30 }, (_, i) => event(Ester.E2, 0.11, 1, Route.sublingualNew, start + 24 * i));
+    const events = Array.from({ length: 30 }, (_, i) => event(Ester.E2, 0.11, 1, Route.sublingual, start + 24 * i));
     const sim = runSimulation(events, 70), index = sim.timeH.indexOf(start + 720);
     assert.ok(index >= 0); close(sim.concPGmL_E2[index], pgMl(trough(30)), 'multi-dose trough');
     const oral = model(event(Ester.E2, 0, 1, Route.oral));
@@ -292,7 +292,7 @@ test('legacy SL and other routes match fixed original fixtures; oral matches wit
     const fixtures = JSON.parse(await readFile(new URL('./fixtures/pk_legacy.json', import.meta.url), 'utf8'));
     for (const { event: e, amountsMG } of fixtures.cases) {
         const oralE2 = e.route === Route.oral && [Ester.E2, Ester.EV].includes(e.ester);
-        applyPKOverrides(oralE2 ? { ...DEFAULT_PK_PARAMS, e2_recycle_strength: 0 } : null);
+        applyPKOverrides(e.route === Route.sublingual ? { ...DEFAULT_PK_PARAMS, sublingualModel: 'legacy' } : oralE2 ? { ...DEFAULT_PK_PARAMS, e2_recycle_strength: 0 } : null);
         const current = model(e);
         fixtures.offsetsH.forEach((t, i) => close(current.amount(e.timeH + t), amountsMG[i], `${e.ester}/${e.route}/${t}`, 2e-8, 1e-11));
     }
@@ -301,7 +301,7 @@ test('legacy SL and other routes match fixed original fixtures; oral matches wit
 
 test('historical and recent SL doses retain dense peri-peak samples with long forecast horizon', () => {
     applyPKOverrides(null);
-    const events = [event(Ester.E2, 0.11, 1, Route.sublingualNew, start - 24 * 365), event()];
+    const events = [event(Ester.E2, 0.11, 1, Route.sublingual, start - 24 * 365), event()];
     const sim = runSimulation(events, 70);
     for (const e of events) for (const offset of [0.125, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3]) {
         const index = sim.timeH.indexOf(e.timeH + offset);
@@ -309,6 +309,64 @@ test('historical and recent SL doses retain dense peri-peak samples with long fo
         const expected = events.reduce((sum, dose) => sum + pgMl(model(dose).amount(e.timeH + offset)), 0);
         close(sim.concPGmL_E2[index], expected, 'historical sample', 1e-8, 1e-8);
     }
+});
+
+test('one canonical route selects three independent models and accepts historical records', () => {
+    const e = event(), raw = { ...e, route: 'sublingualNew', updatedAt: 1234 };
+    const before = structuredClone(raw);
+    const traces = [];
+    const snapshot = model(e), original = snapshot.amount(start + 8);
+    for (const sublingualModel of ['legacy', 'new', 'metabolite']) {
+        applyPKOverrides({ ...DEFAULT_PK_PARAMS, sublingualModel });
+        const canonical = model(e), historical = model(raw);
+        for (const t of at) close(historical.amount(start + t), canonical.amount(start + t));
+        const a = runSimulation([e], 70), b = runSimulation([raw], 70);
+        assert.deepEqual(a, b);
+        close(getBioavailabilityMultiplier(raw.route, raw.ester, raw.extras),
+            getBioavailabilityMultiplier(e.route, e.ester, e.extras));
+        traces.push(canonical.amount(start + 8));
+    }
+    assert.equal(new Set(traces).size, 3);
+    assert.deepEqual(raw, before, 'simulation must never rewrite stored doses');
+    close(snapshot.amount(start + 8), original, 'compiled model survives switching');
+    assert.equal(Object.values(Route).filter(r => r.startsWith('sublingual')).length, 1);
+    applyPKOverrides(null);
+});
+
+test('original new model retains the original fast branch and slow swallowed clearance', () => {
+    const bateman = (t, dose, f, ka, ke) => Math.abs(ka - ke) < 1e-12
+        ? dose * f * ka * t * Math.exp(-ke * t)
+        : dose * f * ka / (ka - ke) * (Math.exp(-ke * t) - Math.exp(-ka * t));
+    for (const ester of [Ester.E2, Ester.EV]) for (const theta of [0, 0.11, 1]) {
+        for (const ke of [0.12, 0.25, 0.41, 2.4]) {
+            applyPKOverrides({ ...DEFAULT_PK_PARAMS, sublingualModel: 'new', e2_kClear: ke });
+            const m = model(event(ester, theta)), f = getToE2Factor(ester);
+            for (const t of at) {
+                const expected = bateman(t, theta, f * 0.28, 2.4, ke)
+                    + bateman(t, 1 - theta, f * 0.03, 0.25, 0.12);
+                close(m.amount(start + t), expected, `${ester}/${theta}/${ke}/${t}`, 1e-8);
+            }
+            const e = event(ester, theta), p = resolveParams(e);
+            assert.ok(computeMaxLifetimeH(p, e.route, [e], e.timeH) >= Math.log(1e8) / Math.min(ke, 0.12));
+        }
+    }
+    applyPKOverrides(null);
+});
+
+test('model selection survives sanitization, backups and temporary calibration overrides', () => {
+    for (const sublingualModel of ['legacy', 'new', 'metabolite']) {
+        const params = { ...DEFAULT_PK_PARAMS, sublingualModel, e2_sl_standard: 0.15 };
+        assert.deepEqual(sanitizePKParams(JSON.parse(JSON.stringify(params))), params);
+        assert.equal(sanitizePKParams({ sublingualModel }).sublingualModel, sublingualModel);
+        applyPKOverrides(params);
+        const sim = runSimulation([event()], 70);
+        runSimulationWithParams([event()], 70, { ...params, e2_kClear: 0.6 });
+        assert.deepEqual(getActivePKParams(), params);
+        assert.deepEqual(runSimulation([event()], 70), sim);
+    }
+    assert.equal(sanitizePKParams({ e2_kClear: 0.6 }).sublingualModel, 'metabolite');
+    assert.equal(sanitizePKParams({ e2_kClear: 0.6, sublingualModel: 'invalid' }).sublingualModel, 'metabolite');
+    applyPKOverrides(null);
 });
 
 test('all seven language packs disclose uncertain return priors; controls have labels/fallback', async () => {

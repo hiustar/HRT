@@ -3,7 +3,7 @@ import type { ShowDialog } from '../contexts/DialogContext';
 import { v4 as uuidv4 } from 'uuid';
 import { DoseEvent, Route, Ester, SimulationResult, runSimulation, interpolateConcentration_E2, interpolateConcentration_CPA, interpolateConcentration_T, LabResult, computeCalibration, CalibrationMethod, CalibrationHistoryMode, normalizeCalibrationMethod, isTestosteroneEster, isT_LabUnit, PKCustomParams, applyPKOverrides, sanitizePKParams, isPlausibleBodyWeightKG,
          BODY_WEIGHT_KG_MIN, BODY_WEIGHT_KG_MAX, DOSE_MG_MAX,
-         EVENT_TIME_H_MIN, EVENT_TIME_H_MAX } from '../../logic';
+         EVENT_TIME_H_MIN, EVENT_TIME_H_MAX, normalizeRoute, normalizeSublingualRecord } from '../../logic';
 import { createDayLabelFormatter, toDayKey } from '../utils/helpers';
 import { detectRegimens, dosesAhead, normalizeSupply, Supply } from '../utils/regimen';
 import { PlanItem, normalizePlanItem, legacyCpaItem, regimensFromPlan } from '../utils/plan';
@@ -12,7 +12,7 @@ import { useHRTMode } from '../contexts/HRTModeContext';
 import { useAuth } from '../contexts/AuthContext';
 import {
     MODE_KEYS, RecordKind, SyncState, Tombstones,
-    pruneTombstones, sanitizeTombstones,
+    pruneTombstones, sanitizeTombstones, readModePayloadBlock, deduplicateRecords,
 } from '../utils/syncMerge';
 
 /** Namespace used while signed out. Its keys are the original, un-prefixed ones. */
@@ -33,7 +33,7 @@ const nsFor = (owner: string, suffix: string) =>
 const modeKeyFor = (owner: string, mode: 'transfem' | 'transmasc', suffix: string) =>
     nsFor(owner, mode === 'transmasc' ? `masc-${suffix}` : suffix);
 
-const MODE_SUFFIXES = ['events', 'lab-results', 'dose-templates', 'quick-doses', 'deletions'] as const;
+const MODE_SUFFIXES = ['events', 'lab-results', 'dose-templates', 'quick-doses', 'deletions', 'plan', 'supplies'] as const;
 const SHARED_SUFFIXES = [
     'weight', 'pk-params', 'cal-method', 'cal-history-mode',
     'weight-at', 'pk-params-at',
@@ -116,6 +116,13 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
         } catch { return fallback; }
     };
 
+    // A route rename is a representation change, not a user edit.
+    const loadRouteRecords = <T extends { id: string },>(key: string): T[] =>
+        deduplicateRecords(loadJSON<T[]>(key, []));
+
+    const newById = <T extends { id: string },>(items: T[], ids: Set<string>): T[] =>
+        deduplicateRecords(items).filter(item => { if (ids.has(item.id)) return false; ids.add(item.id); return true; });
+
     // --- Deletion log ------------------------------------------------------
     // Cloud sync unions records by id, so without a record of what was deleted
     // "the cloud has an id we don't" always reads as "another device added it".
@@ -173,7 +180,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
     };
 
     // --- State ---
-    const [events, setEvents] = useState<DoseEvent[]>(() => loadJSON(keyFor(mode, 'events'), [] as DoseEvent[]));
+    const [events, setEvents] = useState<DoseEvent[]>(() => loadRouteRecords<DoseEvent>(keyFor(mode, 'events')));
     const [weight, setWeightState] = useState<number>(() => {
         // Weight is shared across modes (a physical attribute of the person).
         const saved = localStorage.getItem(sharedKey('weight'));
@@ -204,8 +211,8 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
         setCalibrationHistoryModeState(m);
         localStorage.setItem(sharedKey('cal-history-mode'), m);
     };
-    const [doseTemplates, setDoseTemplates] = useState<DoseTemplate[]>(() => loadJSON(keyFor(mode, 'dose-templates'), [] as DoseTemplate[]));
-    const [quickDoses, setQuickDoses] = useState<QuickDose[]>(() => loadJSON(keyFor(mode, 'quick-doses'), [] as QuickDose[]));
+    const [doseTemplates, setDoseTemplates] = useState<DoseTemplate[]>(() => loadRouteRecords<DoseTemplate>(keyFor(mode, 'dose-templates')));
+    const [quickDoses, setQuickDoses] = useState<QuickDose[]>(() => loadRouteRecords<QuickDose>(keyFor(mode, 'quick-doses')));
     // What's left of each medicine on hand. Kept on this device only, like quick
     // doses: it is a count of the drawer, not part of the medical record, so it
     // stays out of exports and cloud sync.
@@ -260,10 +267,10 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
     useEffect(() => {
         adoptSignedOutData(owner);
         loadedScopeRef.current = null;
-        setEvents(loadJSON(keyFor(mode, 'events'), [] as DoseEvent[]));
+        setEvents(loadRouteRecords<DoseEvent>(keyFor(mode, 'events')));
         setLabResults(loadJSON(keyFor(mode, 'lab-results'), [] as LabResult[]));
-        setDoseTemplates(loadJSON(keyFor(mode, 'dose-templates'), [] as DoseTemplate[]));
-        setQuickDoses(loadJSON(keyFor(mode, 'quick-doses'), [] as QuickDose[]));
+        setDoseTemplates(loadRouteRecords<DoseTemplate>(keyFor(mode, 'dose-templates')));
+        setQuickDoses(loadRouteRecords<QuickDose>(keyFor(mode, 'quick-doses')));
         setSupplies(loadSupplies(mode));
         setPlan(loadPlan(mode));
         // Mode-independent, but still per-account, so they reload on the same beat.
@@ -485,7 +492,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
     // stamp `updatedAt`. Sync uses the stamp to tell an edit from its older
     // twin; an unstamped record silently loses that argument.
     const stamp = <T extends object>(record: T): T & { updatedAt: number } =>
-        ({ ...record, updatedAt: Date.now() });
+        ({ ...normalizeSublingualRecord(record), updatedAt: Date.now() });
 
     const addEvent = (e: DoseEvent) => {
         forgetDeletions('events', [e.id]);
@@ -549,23 +556,31 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
 
     // Quick doses are a per-device shortcut list, not part of the record — they
     // are neither exported nor synced, so no tombstone is needed.
-    const addQuickDose = (dose: QuickDose) => setQuickDoses(prev => [...prev, dose]);
-    const saveSupply = (supply: Supply) => setSupplies(prev => prev.some(s => s.id === supply.id) ? prev.map(s => (s.id === supply.id ? supply : s)) : [...prev, supply]);
+    const addQuickDose = (dose: QuickDose) => setQuickDoses(prev => [...prev, normalizeSublingualRecord(dose)]);
+    const saveSupply = (raw: Supply) => {
+        const supply = normalizeSublingualRecord(raw);
+        setSupplies(prev => prev.some(s => s.id === supply.id) ? prev.map(s => (s.id === supply.id ? supply : s)) : [...prev, supply]);
+    };
     const deleteSupply = (id: string) => setSupplies(prev => prev.filter(s => s.id !== id));
-    const savePlanItem = (item: PlanItem) => setPlan(prev => prev.some(i => i.id === item.id) ? prev.map(i => (i.id === item.id ? item : i)) : [...prev, item]);
+    const savePlanItem = (raw: PlanItem) => {
+        const item = normalizeSublingualRecord(raw);
+        setPlan(prev => prev.some(i => i.id === item.id) ? prev.map(i => (i.id === item.id ? item : i)) : [...prev, item]);
+    };
     const deletePlanItem = (id: string) => setPlan(prev => prev.filter(i => i.id !== id));
     const deleteQuickDose = (id: string) => setQuickDoses(prev => prev.filter(d => d.id !== id));
 
     const touchPkParams = () => localStorage.setItem(sharedKey('pk-params-at'), String(Date.now()));
-    const setPkParams = (params: PKCustomParams) => {
+    const setPkParams = (params: PKCustomParams | null) => {
         touchPkParams();
         applyPKOverrides(params);
         setPkParamsState(params);
     };
     const clearPkParams = () => {
         touchPkParams();
-        applyPKOverrides(null);
-        setPkParamsState(null);
+        const model = pkParams?.sublingualModel;
+        const next = model && model !== 'metabolite' ? sanitizePKParams({ sublingualModel: model }) : null;
+        applyPKOverrides(next);
+        setPkParamsState(next);
     };
     const resetPkParams = () => {
         showDialog('confirm', t('pk.reset_confirm'), () => {
@@ -596,10 +611,11 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
     const sanitizeImportedEvents = (raw: any): DoseEvent[] => {
         if (!Array.isArray(raw)) throw new Error('Invalid format');
         if (raw.length > MAX_IMPORT_ENTRIES) throw new Error('Too many entries');
-        return raw.map((item: any) => {
+        const records = raw.map((item: any) => {
             if (!item || typeof item !== 'object') return null;
-            const { route, timeH, doseMG, ester, extras } = item;
-            if (!Object.values(Route).includes(route)) return null;
+            const { timeH, doseMG, ester, extras } = item;
+            const route = normalizeRoute(item.route);
+            if (!route) return null;
             const timeNum = Number(timeH);
             // Out-of-range timestamps are dropped rather than clamped: moving a
             // record to a date the user never chose is worse than losing it, and
@@ -610,6 +626,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             const validEster = isDrugCode(ester) ? ester : Ester.E2;
             const sanitizedExtras = (extras && typeof extras === 'object') ? extras : {};
             return {
+                ...item,
                 id: typeof item.id === 'string' ? item.id : uuidv4(),
                 route,
                 timeH: timeNum,
@@ -619,6 +636,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 updatedAt: keepStamp(item)
             } as DoseEvent;
         }).filter((item): item is DoseEvent => item !== null);
+        return newById(records, new Set());
     };
 
     const sanitizeImportedLabResults = (raw: any): LabResult[] => {
@@ -644,14 +662,16 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
     const sanitizeImportedTemplates = (raw: any): DoseTemplate[] => {
         if (!Array.isArray(raw)) return [];
         if (raw.length > MAX_IMPORT_ENTRIES) throw new Error('Too many entries');
-        return raw.map((item: any) => {
+        const records = raw.map((item: any) => {
             if (!item || typeof item !== 'object') return null;
-            const { name, route, ester, doseMG, extras, createdAt } = item;
-            if (!Object.values(Route).includes(route)) return null;
+            const { name, ester, doseMG, extras, createdAt } = item;
+            const route = normalizeRoute(item.route);
+            if (!route) return null;
             if (!isDrugCode(ester)) return null;
             const doseNum = Number(doseMG);
             if (!Number.isFinite(doseNum) || doseNum < 0) return null;
             return {
+                ...item,
                 id: typeof item.id === 'string' ? item.id : uuidv4(),
                 name: typeof name === 'string' ? name : 'Template',
                 route,
@@ -662,6 +682,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 updatedAt: keepStamp(item)
             } as DoseTemplate;
         }).filter((item): item is DoseTemplate => item !== null);
+        return newById(records, new Set());
     };
 
     const processImportedData = (parsed: any): boolean => {
@@ -670,7 +691,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             let newWeight: number | undefined = undefined;
             let newLabs: LabResult[] = [];
             let newTemplates: DoseTemplate[] = [];
-            let newPkParams: PKCustomParams | undefined = undefined;
+            let newPkParams: PKCustomParams | null | undefined = undefined;
             let importedOtherMode = false;
             // Which kinds the payload actually *speaks about*, tracked one by
             // one. A single "it had something for this mode" flag replaced all
@@ -687,11 +708,10 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             const replaced = { events: false, labResults: false, doseTemplates: false };
 
             // New multi-mode payload: { modes: { transfem: {...}, transmasc: {...} } }
-            if (parsed && typeof parsed === 'object' && parsed.modes && typeof parsed.modes === 'object') {
-                const modesBlock = parsed.modes as Record<string, any>;
+            const hasModeBlocks = !!parsed && typeof parsed === 'object' && !!parsed.modes && typeof parsed.modes === 'object' && !Array.isArray(parsed.modes);
+            if (hasModeBlocks) {
                 for (const m of ['transfem', 'transmasc'] as const) {
-                    const block = modesBlock[m];
-                    if (!block || typeof block !== 'object') continue;
+                    const block = readModePayloadBlock(parsed, m);
                     const evs = Array.isArray(block.events) ? sanitizeImportedEvents(block.events) : [];
                     const ls = Array.isArray(block.labResults) ? sanitizeImportedLabResults(block.labResults) : [];
                     const tmps = Array.isArray(block.doseTemplates) ? sanitizeImportedTemplates(block.doseTemplates) : [];
@@ -701,8 +721,10 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                         if (Array.isArray(block.doseTemplates)) { newTemplates = tmps; replaced.doseTemplates = true; }
                     } else {
                         // Write other mode's data straight to localStorage.
+                        if (Array.isArray(block.plan)) { localStorage.setItem(keyFor(m, 'plan'), JSON.stringify(block.plan.map(normalizePlanItem).filter(Boolean))); importedOtherMode = true; }
+                        if (Array.isArray(block.supplies)) { localStorage.setItem(keyFor(m, 'supplies'), JSON.stringify(block.supplies.map(normalizeSupply).filter(Boolean))); importedOtherMode = true; }
                         if (Array.isArray(block.events)) {
-                            reconcileReplacement(m, 'events', loadJSON<DoseEvent[]>(keyFor(m, 'events'), []), evs);
+                            reconcileReplacement(m, 'events', loadRouteRecords<DoseEvent>(keyFor(m, 'events')), evs);
                             localStorage.setItem(keyFor(m, 'events'), JSON.stringify(evs));
                             importedOtherMode = true;
                         }
@@ -712,7 +734,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                             importedOtherMode = true;
                         }
                         if (Array.isArray(block.doseTemplates)) {
-                            reconcileReplacement(m, 'doseTemplates', loadJSON<DoseTemplate[]>(keyFor(m, 'dose-templates'), []), tmps);
+                            reconcileReplacement(m, 'doseTemplates', loadRouteRecords<DoseTemplate>(keyFor(m, 'dose-templates')), tmps);
                             localStorage.setItem(keyFor(m, 'dose-templates'), JSON.stringify(tmps));
                             importedOtherMode = true;
                         }
@@ -721,7 +743,9 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 if (typeof parsed.weight === 'number' && Number.isFinite(parsed.weight) && parsed.weight > 0) {
                     newWeight = Math.min(BODY_WEIGHT_KG_MAX, Math.max(BODY_WEIGHT_KG_MIN, parsed.weight));
                 }
-                if (parsed.pkParams && typeof parsed.pkParams === 'object') {
+                if (parsed.pkParams === null) {
+                    newPkParams = null;
+                } else if (parsed.pkParams && typeof parsed.pkParams === 'object') {
                     newPkParams = sanitizePKParams(parsed.pkParams) ?? undefined;
                 }
             } else if (Array.isArray(parsed)) {
@@ -743,7 +767,9 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                     newTemplates = sanitizeImportedTemplates(parsed.doseTemplates);
                     replaced.doseTemplates = true;
                 }
-                if (parsed.pkParams && typeof parsed.pkParams === 'object') {
+                if (parsed.pkParams === null) {
+                    newPkParams = null;
+                } else if (parsed.pkParams && typeof parsed.pkParams === 'object') {
                     newPkParams = sanitizePKParams(parsed.pkParams) ?? undefined;
                 }
             }
@@ -751,7 +777,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             // v1 flat-format safety: if the payload contains items that belong to
             // the *other* HRT mode (T esters / T-unit labs), siphon them into that
             // mode's storage so they don't silently corrupt the active record.
-            if (!('modes' in (parsed || {}))) {
+            if (!hasModeBlocks) {
                 const otherMode: 'transfem' | 'transmasc' = mode === 'transmasc' ? 'transfem' : 'transmasc';
                 const eventBelongs = (e: DoseEvent) =>
                     mode === 'transmasc' ? isTestosteroneEster(e.ester) : !isTestosteroneEster(e.ester);
@@ -759,12 +785,12 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 const otherEvs: DoseEvent[] = [];
                 for (const e of newEvents) (eventBelongs(e) ? keepEvs : otherEvs).push(e);
                 if (otherEvs.length) {
-                    const existing = loadJSON<DoseEvent[]>(keyFor(otherMode, 'events'), []);
+                    const existing = loadRouteRecords<DoseEvent>(keyFor(otherMode, 'events'));
                     const existingIds = new Set(existing.map(x => x.id));
                     forgetDeletions('events', otherEvs.map(e => e.id), otherMode);
                     localStorage.setItem(
                         keyFor(otherMode, 'events'),
-                        JSON.stringify([...existing, ...otherEvs.filter(e => !existingIds.has(e.id))])
+                        JSON.stringify([...existing, ...newById(otherEvs, existingIds)])
                     );
                     importedOtherMode = true;
                     newEvents = keepEvs;
@@ -780,14 +806,17 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                     forgetDeletions('labResults', otherLs.map(l => l.id), otherMode);
                     localStorage.setItem(
                         keyFor(otherMode, 'lab-results'),
-                        JSON.stringify([...existing, ...otherLs.filter(l => !existingIds.has(l.id))])
+                        JSON.stringify([...existing, ...newById(otherLs, existingIds)])
                     );
                     importedOtherMode = true;
                     newLabs = keepLs;
                 }
             }
 
-            if (!importedOtherMode && !newEvents.length && !newWeight && !newLabs.length && !newTemplates.length && !newPkParams) throw new Error('No valid entries');
+            const activeBlock = hasModeBlocks ? readModePayloadBlock(parsed, mode) : parsed;
+            if (!importedOtherMode && !replaced.events && !replaced.labResults && !replaced.doseTemplates
+                && !newWeight && newPkParams === undefined
+                && !Array.isArray(activeBlock?.plan) && !Array.isArray(activeBlock?.supplies)) throw new Error('No valid entries');
 
             // A replace-import states the whole set for each kind it mentions,
             // so anything it drops from one is a deletion. Recording it is what
@@ -806,13 +835,13 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 setDoseTemplates(newTemplates);
             }
             // 导入恢复用药方案与耗材
-            const rawPlan = parsed?.plan || parsed?.modes?.[mode]?.plan;
+            const rawPlan = activeBlock?.plan;
             if (Array.isArray(rawPlan)) {
                 const newPlan = rawPlan.map(normalizePlanItem).filter((x: any): x is PlanItem => x !== null);
                 localStorage.setItem(keyFor(mode, 'plan'), JSON.stringify(newPlan));
                 setPlan(newPlan);
             }
-            const rawSupplies = parsed?.supplies || parsed?.modes?.[mode]?.supplies;
+            const rawSupplies = activeBlock?.supplies;
             if (Array.isArray(rawSupplies)) {
                 const newSupplies = rawSupplies.map(normalizeSupply).filter((x: any): x is Supply => x !== null);
                 localStorage.setItem(keyFor(mode, 'supplies'), JSON.stringify(newSupplies));
@@ -838,11 +867,10 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             let incomingTemplates: DoseTemplate[] = [];
             let mergedOther = 0;
 
-            if (parsed && typeof parsed === 'object' && parsed.modes && typeof parsed.modes === 'object') {
-                const modesBlock = parsed.modes as Record<string, any>;
+            const hasModeBlocks = !!parsed && typeof parsed === 'object' && !!parsed.modes && typeof parsed.modes === 'object' && !Array.isArray(parsed.modes);
+            if (hasModeBlocks) {
                 for (const m of ['transfem', 'transmasc'] as const) {
-                    const block = modesBlock[m];
-                    if (!block || typeof block !== 'object') continue;
+                    const block = readModePayloadBlock(parsed, m);
                     const evs = Array.isArray(block.events) ? sanitizeImportedEvents(block.events) : [];
                     const ls = Array.isArray(block.labResults) ? sanitizeImportedLabResults(block.labResults) : [];
                     const tmps = Array.isArray(block.doseTemplates) ? sanitizeImportedTemplates(block.doseTemplates) : [];
@@ -852,15 +880,25 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                         incomingTemplates = tmps;
                     } else {
                         // Merge into the other mode's localStorage directly.
-                        const existingEvs = loadJSON<DoseEvent[]>(keyFor(m, 'events'), []);
+                        if (Array.isArray(block.plan)) {
+                            const existing = loadPlan(m);
+                            const incoming = block.plan.map(normalizePlanItem).filter((x: PlanItem | null): x is PlanItem => x !== null);
+                            localStorage.setItem(keyFor(m, 'plan'), JSON.stringify([...existing, ...newById(incoming, new Set(existing.map(i => i.id)))]));
+                        }
+                        if (Array.isArray(block.supplies)) {
+                            const existing = loadSupplies(m);
+                            const incoming = block.supplies.map(normalizeSupply).filter((x: Supply | null): x is Supply => x !== null);
+                            localStorage.setItem(keyFor(m, 'supplies'), JSON.stringify([...existing, ...newById(incoming, new Set(existing.map(i => i.id)))]));
+                        }
+                        const existingEvs = loadRouteRecords<DoseEvent>(keyFor(m, 'events'));
                         const existingLs = loadJSON<LabResult[]>(keyFor(m, 'lab-results'), []);
-                        const existingTmps = loadJSON<DoseTemplate[]>(keyFor(m, 'dose-templates'), []);
+                        const existingTmps = loadRouteRecords<DoseTemplate>(keyFor(m, 'dose-templates'));
                         const evIds = new Set(existingEvs.map(e => e.id));
                         const lsIds = new Set(existingLs.map(l => l.id));
                         const tmpIds = new Set(existingTmps.map(tm => tm.id));
-                        const newEvs = evs.filter(e => !evIds.has(e.id));
-                        const newLs = ls.filter(l => !lsIds.has(l.id));
-                        const newTmps = tmps.filter(tm => !tmpIds.has(tm.id));
+                        const newEvs = newById(evs, evIds);
+                        const newLs = newById(ls, lsIds);
+                        const newTmps = newById(tmps, tmpIds);
                         // An explicit merge is the user asking for these records
                         // back, so any tombstone standing in the way goes.
                         forgetDeletions('events', evs.map(e => e.id), m);
@@ -885,7 +923,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             // v1 flat-format safety (merge): siphon wrong-mode events *and labs*
             // into the other mode's store so a transfem backup merged from
             // transmasc mode doesn't contaminate the transmasc record.
-            if (!('modes' in (parsed || {}))) {
+            if (!hasModeBlocks) {
                 const otherMode: 'transfem' | 'transmasc' = mode === 'transmasc' ? 'transfem' : 'transmasc';
                 const eventBelongs = (e: DoseEvent) =>
                     mode === 'transmasc' ? isTestosteroneEster(e.ester) : !isTestosteroneEster(e.ester);
@@ -893,9 +931,9 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 const otherEvs: DoseEvent[] = [];
                 for (const e of incomingEvents) (eventBelongs(e) ? keepEvs : otherEvs).push(e);
                 if (otherEvs.length) {
-                    const existing = loadJSON<DoseEvent[]>(keyFor(otherMode, 'events'), []);
+                    const existing = loadRouteRecords<DoseEvent>(keyFor(otherMode, 'events'));
                     const existingIds = new Set(existing.map(x => x.id));
-                    const newOnes = otherEvs.filter(e => !existingIds.has(e.id));
+                    const newOnes = newById(otherEvs, existingIds);
                     forgetDeletions('events', otherEvs.map(e => e.id), otherMode);
                     if (newOnes.length) {
                         localStorage.setItem(keyFor(otherMode, 'events'), JSON.stringify([...existing, ...newOnes]));
@@ -911,7 +949,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
                 if (otherLs.length) {
                     const existing = loadJSON<LabResult[]>(keyFor(otherMode, 'lab-results'), []);
                     const existingIds = new Set(existing.map(x => x.id));
-                    const newOnes = otherLs.filter(l => !existingIds.has(l.id));
+                    const newOnes = newById(otherLs, existingIds);
                     forgetDeletions('labResults', otherLs.map(l => l.id), otherMode);
                     if (newOnes.length) {
                         localStorage.setItem(keyFor(otherMode, 'lab-results'), JSON.stringify([...existing, ...newOnes]));
@@ -931,7 +969,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             // in time).
             if (incomingEvents.length > 0) {
                 const existingIds = new Set(events.map(e => e.id));
-                const newOnes = incomingEvents.filter(e => !existingIds.has(e.id));
+                const newOnes = newById(incomingEvents, existingIds);
                 merged += newOnes.length;
                 forgetDeletions('events', incomingEvents.map(e => e.id));
                 if (newOnes.length > 0) setEvents(prev => [...prev, ...newOnes]);
@@ -943,7 +981,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
 
             if (incomingLabs.length > 0) {
                 const existingIds = new Set(labResults.map(r => r.id));
-                const newOnes = incomingLabs.filter(r => !existingIds.has(r.id));
+                const newOnes = newById(incomingLabs, existingIds);
                 merged += newOnes.length;
                 forgetDeletions('labResults', incomingLabs.map(r => r.id));
                 if (newOnes.length > 0) setLabResults(prev => [...prev, ...newOnes]);
@@ -951,27 +989,28 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
 
             if (incomingTemplates.length > 0) {
                 const existingIds = new Set(doseTemplates.map(t => t.id));
-                const newOnes = incomingTemplates.filter(t => !existingIds.has(t.id));
+                const newOnes = newById(incomingTemplates, existingIds);
                 merged += newOnes.length;
                 forgetDeletions('doseTemplates', incomingTemplates.map(t => t.id));
                 if (newOnes.length > 0) setDoseTemplates(prev => [...prev, ...newOnes]);
             }
 
             // 合并用药方案与耗材
-            const rawPlan = parsed?.plan || parsed?.modes?.[mode]?.plan;
+            const activeBlock = hasModeBlocks ? readModePayloadBlock(parsed, mode) : parsed;
+            const rawPlan = activeBlock?.plan;
             if (Array.isArray(rawPlan)) {
                 const newPlan = rawPlan.map(normalizePlanItem).filter((x: any): x is PlanItem => x !== null);
                 const existingIds = new Set(plan.map(i => i.id));
-                const toAdd = newPlan.filter(i => !existingIds.has(i.id));
+                const toAdd = newById(newPlan, existingIds);
                 const mergedPlan = [...plan, ...toAdd];
                 localStorage.setItem(keyFor(mode, 'plan'), JSON.stringify(mergedPlan));
                 setPlan(mergedPlan);
             }
-            const rawSupplies = parsed?.supplies || parsed?.modes?.[mode]?.supplies;
+            const rawSupplies = activeBlock?.supplies;
             if (Array.isArray(rawSupplies)) {
                 const newSupplies = rawSupplies.map(normalizeSupply).filter((x: any): x is Supply => x !== null);
                 const existingIds = new Set(supplies.map(s => s.id));
-                const toAdd = newSupplies.filter(s => !existingIds.has(s.id));
+                const toAdd = newById(newSupplies, existingIds);
                 const mergedSupplies = [...supplies, ...toAdd];
                 localStorage.setItem(keyFor(mode, 'supplies'), JSON.stringify(mergedSupplies));
                 setSupplies(mergedSupplies);
@@ -988,10 +1027,10 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
 
     const buildExportPayload = () => {
         const readMode = (m: 'transfem' | 'transmasc') => ({
-            events: loadJSON<DoseEvent[]>(keyFor(m, 'events'), []),
+            events: loadRouteRecords<DoseEvent>(keyFor(m, 'events')),
             labResults: loadJSON<LabResult[]>(keyFor(m, 'lab-results'), []),
-            doseTemplates: loadJSON<DoseTemplate[]>(keyFor(m, 'dose-templates'), []),
-            plan: loadJSON<PlanItem[]>(keyFor(m, 'plan'), []),
+            doseTemplates: loadRouteRecords<DoseTemplate>(keyFor(m, 'dose-templates')),
+            plan: loadJSON<PlanItem[]>(keyFor(m, 'plan'), []).map(normalizeSublingualRecord),
             supplies: loadJSON<unknown[]>(keyFor(m, 'supplies'), []).map(normalizeSupply).filter((x): x is Supply => x !== null),
             deletions: readTombstones(m),
         });
@@ -1000,7 +1039,7 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             transmasc: readMode('transmasc'),
         };
         // Overlay current in-memory state for the active mode.
-        modes[mode] = { events, labResults, doseTemplates, plan, supplies, deletions: readTombstones(mode) };
+        modes[mode] = { events: events.map(normalizeSublingualRecord), labResults, doseTemplates: doseTemplates.map(normalizeSublingualRecord), plan: plan.map(normalizeSublingualRecord), supplies: supplies.map(normalizeSublingualRecord), deletions: readTombstones(mode) };
 
         return {
             meta: { version: 2, exportedAt: new Date().toISOString() },
@@ -1008,11 +1047,11 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             weight,
             weightUpdatedAt: Number(localStorage.getItem(sharedKey('weight-at'))) || undefined,
             modes,
-            events,
+            events: modes[mode].events,
             labResults,
-            doseTemplates,
-            plan,
-            supplies,
+            doseTemplates: modes[mode].doseTemplates,
+            plan: modes[mode].plan,
+            supplies: modes[mode].supplies,
             pkParams: pkParams ?? null,
             pkParamsUpdatedAt: Number(localStorage.getItem(sharedKey('pk-params-at'))) || undefined,
         };
@@ -1049,14 +1088,14 @@ export const useAppData = (showDialog: ShowDialog, { withPrediction = false }: {
             // 同步恢复用药方案 (plan)
             const rawPlan = (state.modes[block.m] as any)?.plan || (block.m === mode ? (state as any).plan : null);
             if (Array.isArray(rawPlan)) {
-                localStorage.setItem(keyFor(block.m, 'plan'), JSON.stringify(rawPlan));
+                localStorage.setItem(keyFor(block.m, 'plan'), JSON.stringify(rawPlan.map(normalizeSublingualRecord)));
                 if (block.m === mode) setPlan(rawPlan.map(normalizePlanItem).filter((x): x is PlanItem => x !== null));
             }
 
             // 同步恢复耗材库存 (supplies)
             const rawSupplies = (state.modes[block.m] as any)?.supplies || (block.m === mode ? (state as any).supplies : null);
             if (Array.isArray(rawSupplies)) {
-                localStorage.setItem(keyFor(block.m, 'supplies'), JSON.stringify(rawSupplies));
+                localStorage.setItem(keyFor(block.m, 'supplies'), JSON.stringify(rawSupplies.map(normalizeSublingualRecord)));
                 if (block.m === mode) setSupplies(rawSupplies.map(normalizeSupply).filter((x): x is Supply => x !== null));
             }
 
