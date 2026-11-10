@@ -397,6 +397,44 @@ class HRTServerHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=DIST_DIR, **kwargs)
 
+    def _write_http_log(self, level, message, status_code=None):
+        # Datadog recognises the JSON status field. Keep each event on one line
+        # and omit query strings, which may contain credentials or share tokens.
+        method = getattr(self, 'command', None) or '-'
+        path = (getattr(self, 'path', None) or '-').split('?', 1)[0].split('#', 1)[0]
+        entry = {
+            'status': level,
+            'message': message,
+            'http': {'method': method, 'url': path},
+            'network': {'client': {'ip': self.address_string()}},
+        }
+        if status_code is not None:
+            entry['http']['status_code'] = status_code
+        stream = sys.stderr if level == 'error' else sys.stdout
+        stream.write(json.dumps(entry, ensure_ascii=True, separators=(',', ':')) + '\n')
+        stream.flush()
+
+    def log_request(self, code='-', size='-'):
+        try:
+            status_code = int(code)
+        except (TypeError, ValueError):
+            status_code = None
+        level = ('warning' if status_code is None or 400 <= status_code < 500
+                 else 'error' if status_code >= 500 else 'info')
+        method = getattr(self, 'command', None) or '-'
+        path = (getattr(self, 'path', None) or '-').split('?', 1)[0].split('#', 1)[0]
+        self._write_http_log(level, f'{method} {path} {code}', status_code)
+
+    def log_error(self, format, *args):
+        # send_error() always follows this diagnostic with log_request().
+        # That response already has the proper severity; don't duplicate it.
+        if format == 'code %d, message %s' and len(args) == 2:
+            return
+        self._write_http_log('error', format % args)
+
+    def log_message(self, format, *args):
+        self._write_http_log('info', format % args)
+
     def send_cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
